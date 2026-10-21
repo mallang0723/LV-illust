@@ -8,7 +8,10 @@ src/frontend.mjs 입력창 버튼 '삽화가 설정' + 호스트 모달(설정/�
 scripts/build.mjs  src -> dist (의존성 없음). 빌드: node scripts/build.mjs
 scripts/pack.mjs   dist/+spindle.json+README* -> release/lv_illust-<version>.zip (재현 가능한 빌드,
                    고정 타임스탬프 + zip -X, 두 번 빌드해도 바이트 단위로 동일함 확인됨)
-test/            node --test test/*.test.mjs — 2026-10-21 기준 전부 통과, 129개(다섯 차례 리뷰 반영 후)
+test/            node --test test/*.test.mjs — 2026-10-21 기준 전부 통과, 143개(0.1.1: 권한 늦게 허용·부분 로드 실패·
+                 operator 설치 userId 테스트 추가)
+test/e2e/modal.e2e.mjs  Playwright(Firefox·Chromium, 터치 360x460)로 설정 창이 실제로 눌리는지 확인 —
+                 node --test에는 안 들어감. 실행법은 파일 머리 주석
 
 문서
 docs/DESIGN.md     설계안(사용자 승인본)
@@ -24,9 +27,11 @@ README.md / README.en.md  공개 가능한 수준의 설명(한/영) — 기능�
 알려진 한계 (docs/API-NOTES.md 참고)
 - 메시지 속 그림 렌더링 문법(마크다운 이미지)이 루미버스 화면에서 실제로 그림으로 보이는지 미시험.
   실제 서버에서 <pic prompt="..."> 한 번 써 보고 확인 필요 (DESIGN.md §6 "만들기 전 첫 작업"에 해당).
-- MESSAGE_EDITED 이벤트의 payload 모양을 추정함(실제 수정으로 확인 안 함) — 단, 신뢰하는 필드는
-  chatId/message.id뿐이고 나머지(내용·메타데이터·is_user)는 전부 chat.getMessages로 다시 읽어 확인하므로,
-  추정이 틀려도 조용히 아무 일도 안 함(안전하게 실패)이지 다른 확장 메타데이터를 덮어쓰지 않음.
+- MESSAGE_EDITED 이벤트 payload는 { chatId, message } — 0.1.1에서 루미버스 1.2.5 소스로 확인
+  (chats.service.ts:2871 등). 신뢰하는 필드는 chatId/message.id뿐이고 나머지는 chat.getMessages로 다시 읽음.
+- 0.1.1: 권한을 확장 시작 뒤에 허용해도 재시작 없이 GENERATION_ENDED 구독·인터셉터가 다시 등록되고,
+  열려 있는 설정 창도 실패한 항목만 자동으로 다시 불러옴. Import Local 설치(operator 범위)에서 필요한
+  userId를 모든 호출에 넘김. 자세한 근거는 docs/API-NOTES.md "0.1.1" 절.
 - registerMessageAction(말풍선 버튼)은 존재를 확인했지만 이번 MVP엔 안 씀 — 패널의 "다시 그리기" 목록만.
 
 검토 이력 메모

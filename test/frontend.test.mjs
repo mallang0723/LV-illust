@@ -19,8 +19,10 @@ const flush = async () => { for (let i = 0; i < 10; i++) await new Promise((r) =
 
 function harness({ reply, characterId = 'ch1' } = {}) {
   const frames = [];
+  const evs = {};
   let onBackend, onClick, modal = null;
   const defaults = {
+    load_status: { missing: [] },
     load_settings: { settings: { position: 'depth', depth: 4, role: 'system', maxImages: 2 } },
     load_registry: { registry: [] },
     load_auto: { auto: true },
@@ -37,7 +39,7 @@ function harness({ reply, characterId = 'ch1' } = {}) {
   const ctx = {
     ui,
     getActiveChat: () => ({ chatId: 'c1', characterId }),
-    events: { on: () => () => {} },
+    events: { on: (ev, f) => { (evs[ev] ||= []).push(f); return () => {}; } },
     state: { subscribe: () => () => {} },
     onBackendMessage: (f) => { onBackend = f; return () => {}; },
     sendToBackend: (p) => {
@@ -52,6 +54,9 @@ function harness({ reply, characterId = 'ch1' } = {}) {
     frames, stop,
     async open() { await flush(); onClick(); await flush(); return modal; },
     status: () => modal.root.querySelector('.lvil-status').textContent,
+    push: (msg) => onBackend(msg),
+    emitEvent: (ev, payload) => { for (const f of evs[ev] || []) f(payload); },
+    get modal() { return modal; },
   };
 }
 
@@ -269,5 +274,115 @@ test('REGRESSION (2nd pass, finding 6): an orphaned image shows status/reason on
   assert.equal(regenButtons.length, 1, 'only the non-orphan image gets a regenerate button');
   const reasonText = modal.root.find((n) => (n.textContent || '').includes('메시지가 바뀌어 넣지 못함'));
   assert.ok(reasonText, 'the orphan\'s reason must still be shown');
+  h.stop();
+});
+
+// ---------------------------------------------------------------- independent loads / permission states
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const allText = (root) => [...root.walk()].map((n) => n.textContent || '').join(' ');
+const findBtn = (root, re) => root.find((n) => n.tagName === 'BUTTON' && re.test(n.textContent));
+
+test('PARTIAL LOAD FAILURE: one failed load only disables its own section; status names it with a retry', async () => {
+  const h = harness({ reply: (p) => (p.type === 'list_images' ? { ok: false, error: '목록 오류' } : undefined) });
+  const modal = await h.open();
+  // unrelated controls stay usable (previously a single shared ready=false disabled them all)
+  assert.equal(findBtn(modal.root, /켜짐 \(끄기\)/).disabled, false, 'auto toggle usable');
+  assert.equal(modal.root.find((n) => n.tagName === 'SELECT').disabled, false, 'settings usable');
+  assert.equal(findBtn(modal.root, /\+ 인물 추가/).disabled, false, 'registry usable');
+  const fail = modal.root.querySelector('.lvil-loadfail');
+  assert.ok(fail, 'a failed-load line is shown');
+  assert.match(allText(fail), /그림 목록/);
+  assert.doesNotMatch(allText(fail), /설정|인물 등록부|자동 생성/);
+  // tapping the auto toggle still works
+  findBtn(modal.root, /켜짐 \(끄기\)/).click();
+  await flush();
+  assert.ok(h.frames.some((f) => f.type === 'set_auto'));
+  h.stop();
+});
+
+test('PARTIAL LOAD FAILURE: "다시 시도" re-requests only the failed load', async () => {
+  let failImages = true;
+  const h = harness({ reply: (p) => (p.type === 'list_images' && failImages ? { ok: false, error: '목록 오류' } : undefined) });
+  const modal = await h.open();
+  const before = h.frames.length;
+  failImages = false;
+  modal.root.querySelector('.lvil-loadfail').find((n) => n.tagName === 'BUTTON').click();
+  await flush();
+  const retried = h.frames.slice(before).map((f) => f.type).filter((t) => t !== 'load_status');
+  assert.deepEqual(retried, ['list_images']);
+  assert.equal(modal.root.querySelector('.lvil-loadfail'), null, 'failure line gone after a successful retry');
+  h.stop();
+});
+
+test('PERMISSION STATE: a permission-denied load shows "권한 허용 후 다시 시도" and recovers automatically on the backend push', async () => {
+  let granted = false;
+  const h = harness({
+    reply: (p) => {
+      if (!granted && p.type === 'load_registry') return { ok: false, error: 'PERMISSION_DENIED: characters — Characters permission not granted', permission: 'characters' };
+      if (!granted && p.type === 'list_images') return { ok: false, error: 'PERMISSION_DENIED: chat_mutation — x', permission: 'chat_mutation' };
+      if (p.type === 'load_status') return { missing: granted ? [] : ['characters', 'chat_mutation', 'generation', 'interceptor'] };
+      return undefined;
+    },
+  });
+  const modal = await h.open();
+  const text = allText(modal.root);
+  assert.match(text, /권한 허용 후 다시 시도/);
+  assert.match(text, /characters/);
+  assert.match(text, /아직 허용되지 않은 권한/);
+  assert.doesNotMatch(text, /PERMISSION_DENIED/, 'raw host error string is not what the user reads');
+  assert.equal(findBtn(modal.root, /\+ 인물 추가/).disabled, true, 'registry waits for its permission');
+  assert.equal(findBtn(modal.root, /켜짐 \(끄기\)/).disabled, false, 'settings/auto (no permission needed) usable right away');
+  granted = true;
+  // host: one notification per granted permission -> backend pushes each; burst collapses
+  const before = h.frames.length;
+  for (const p of ['characters', 'chat_mutation', 'generation', 'interceptor']) h.push({ type: 'permissions_changed', permission: p, granted: true });
+  await sleep(300); await flush();
+  const retried = h.frames.slice(before).map((f) => f.type).sort();
+  assert.deepEqual(retried, ['list_images', 'load_registry', 'load_status'], 'one retry of just the failed loads (+ status)');
+  assert.equal(findBtn(h.modal.root, /\+ 인물 추가/).disabled, false, 'registry usable without reopening');
+  assert.doesNotMatch(allText(h.modal.root), /권한 허용 후 다시 시도|아직 허용되지 않은 권한/);
+  h.stop();
+});
+
+test('PERMISSION STATE: the host-wide SPINDLE_PERMISSION_CHANGED event also triggers the retry', async () => {
+  let granted = false;
+  const h = harness({ reply: (p) => (!granted && p.type === 'list_images' ? { ok: false, error: 'PERMISSION_DENIED: chat_mutation — x', permission: 'chat_mutation' } : undefined) });
+  const modal = await h.open();
+  assert.ok(modal.root.querySelector('.lvil-loadfail'), 'failure shown before the grant');
+  const before = h.frames.length;
+  granted = true;
+  h.emitEvent('SPINDLE_PERMISSION_CHANGED', { extensionId: 'x', permission: 'chat_mutation', granted: true, allGranted: ['chat_mutation'] });
+  await sleep(300); await flush();
+  assert.deepEqual(h.frames.slice(before).map((f) => f.type).filter((t) => t !== 'load_status'), ['list_images']);
+  assert.equal(h.modal.root.querySelector('.lvil-loadfail'), null);
+  h.stop();
+});
+
+test('PERMISSION STATE: a typed-but-unsaved registry name survives the automatic re-render', async () => {
+  let granted = false;
+  const h = harness({ reply: (p) => (!granted && p.type === 'list_images' ? { ok: false, error: 'PERMISSION_DENIED: chat_mutation — x', permission: 'chat_mutation' } : undefined) });
+  const modal = await h.open();
+  findBtn(modal.root, /\+ 인물 추가/).click();
+  await flush();
+  const input = modal.root.find((n) => n.tagName === 'INPUT' && n.attrs.placeholder === '이름/별칭 (쉼표로 구분)');
+  input.value = '정수빈';
+  for (const f of input.listeners.input || []) f({ target: input });
+  granted = true;
+  h.push({ type: 'permissions_changed', permission: 'chat_mutation', granted: true });
+  await sleep(300); await flush();
+  const again = h.modal.root.find((n) => n.tagName === 'INPUT' && n.attrs.placeholder === '이름/별칭 (쉼표로 구분)');
+  assert.ok(again && again !== input, 're-rendered');
+  assert.equal(again.attrs.value, '정수빈');
+  h.stop();
+});
+
+test('a timed-out or failed load never leaves the panel blank: the other sections still render their controls', async () => {
+  const h = harness({ reply: (p) => (p.type === 'load_settings' ? { ok: false, error: '응답 시간 초과', timeout: true } : undefined) });
+  const modal = await h.open();
+  assert.equal(modal.root.find((n) => n.tagName === 'SELECT').disabled, true, 'settings waits for its own load');
+  assert.equal(findBtn(modal.root, /켜짐 \(끄기\)/).disabled, false);
+  assert.ok(findBtn(modal.root, /^다시 그리기$/) === null || findBtn(modal.root, /^다시 그리기$/).disabled === false);
+  assert.match(allText(modal.root.querySelector('.lvil-loadfail')), /설정/);
   h.stop();
 });

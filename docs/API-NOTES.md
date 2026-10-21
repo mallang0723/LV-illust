@@ -240,16 +240,18 @@ caveat as the LoRA/style preset finding above).
   wiring — a swipe or regenerate is just another `GENERATION_ENDED` for a (possibly new)
   `messageId` with new `content`. **This is the basis for F2's swipe/regenerate handling**
   and was not independently exercised against a live swipe.
-- `MESSAGE_EDITED` **UNVERIFIED payload shape.** It is only exposed through the generic
-  `on(event: string, handler: (payload: unknown, userId?) => void)` overload — there is
-  no `MessageEditedPayloadDTO` type anywhere in the `.d.ts` files I read. I inferred the
-  shape `{ chatId, message }` by analogy with the sibling `MessageSwipedPayloadDTO` /
-  `SwipeEditedPayloadDTO` (both of which *do* have that shape plus their own
-  discriminator fields), and `source-message-metadata.ts`'s existence suggests message
-  objects flow through events uniformly. `backend.mjs`'s handler defensively bails out
-  (`if (!message || !chatId || message.is_user) return;`) if the shape doesn't match, so
-  a wrong guess fails safe (does nothing) rather than throwing. **Needs a live edit to
-  confirm the payload before trusting MESSAGE_EDITED reprocessing in practice.**
+- `MESSAGE_EDITED` payload is `{ chatId, message }` — **VERIFIED from host source**
+  (Lumiverse 1.2.5 checkout, `src/services/chats.service.ts`): `updateMessage` emits
+  `eventBus.emit(EventType.MESSAGE_EDITED, { chatId: updated.chat_id, message: updated }, userId)`
+  at :2871, and the other emit sites use the same shape (:2399, :2494, :2589, :2693,
+  :2975, :3775). `message` is the raw stored `Message` row (so it carries `extra`, not the
+  split-out `metadata` that `chat.getMessages` returns). The worker receives the bus
+  payload verbatim (`worker-host.ts` `handleSubscribeEvent` posts `payload: msg.payload`,
+  ~2735-2741) and the runtime calls `handler(msg.payload, msg.userId)`
+  (`worker-runtime.ts` ~4626). `backend.mjs` uses only `chatId` and `message.id` from it
+  and re-reads everything else through `getMessages`, which is exactly right for this
+  shape. Note the extension's own `chat.updateMessage` write also fires MESSAGE_EDITED;
+  the re-run finds no live tags and is a no-op (covered by the idempotency tests).
 
 ## Registry storage (F4)
 
@@ -282,6 +284,15 @@ caveat as the LoRA/style preset finding above).
   / `regenerate` backend calls), which is simpler and already covers "list images in the
   current chat with regenerate" per the task's primary ask. Wiring `registerMessageAction`
   too is a reasonable half-day follow-up, not done here.
+- **Update (0.1.1, source now available at the 1.2.5 checkout):** the chat renderer is
+  `marked` with a custom image renderer — `frontend/src/components/chat/MessageContent.tsx:4`
+  (`import { marked }`) and :99-100 (`renderer.image` -> `<img src=... data-lightbox>`); the
+  rich-HTML sanitizer keeps an `<img>` whose `src` starts with `/` or is http(s)
+  (`frontend/src/lib/richHtmlSanitizer.ts:79-93`), and the host's image URL is the relative
+  `/api/v1/image-gen/results/<id>` (`worker-host-image-gen-api.ts:198`). So
+  `![그림:id|요약](/api/...)` *should* render as a picture — **INFERRED from source**, still
+  not seen on the live server. The original note below stands until someone looks at one
+  real reply.
 - **UNVERIFIED: how message content is rendered.** I could not read Lumiverse's own chat
   frontend source (it ships as a compiled bundle under `/app/frontend/dist`, not
   TypeScript source, and reading minified bundle code wasn't a good use of the budget).
@@ -638,6 +649,125 @@ data-loss regression of its own, and the malformed-tag structural fix for findin
 
 Both findings confirmed real against the actual code and reproduced before fixing;
 none rejected. 129 tests total (was 124), all passing.
+
+## 0.1.1 — permissions granted after start; panel unusable on a phone
+
+Reported: on a phone (Firefox for Android) the "삽화가 설정" window opened but nothing in it
+could be tapped, and it persisted after a restart; the same phone's LV-DnH-Menu modal
+worked. Server log: the extension started at 13:23:17, permissions were granted at
+13:23:22, and the host logged `Generation permission required for event:
+GENERATION_ENDED` and `Interceptor permission not granted`. All citations below are to the
+Lumiverse 1.2.5 source checkout (read-only).
+
+### Root cause 1 — registrations dropped at startup were never retried (VERIFIED)
+
+- `handleSubscribeEvent` (`src/spindle/worker-host.ts:2695-2715`): GENERATION_ENDED is in
+  `GENERATION_EVENTS` (:2685-2691); without `generation` the host logs the exact warning
+  above, posts `permission_denied` (`operation: "subscribe_event:GENERATION_ENDED"`) and
+  **returns** — the subscription is never installed.
+- `handleRegisterInterceptor` (`worker-host.ts:2946-2956`): without `interceptor` it logs
+  `Interceptor permission not granted`, posts `permission_denied`
+  (`operation: "registerInterceptor"`) and returns.
+- Neither is retried by the host. A later grant does reach the running worker:
+  `PATCH` permissions route `src/routes/spindle.routes.ts:493-503` calls
+  `lifecycle.notifyPermissionChanged(ext.id, perm, granted, allGranted)` **once per
+  permission** -> `src/spindle/lifecycle.ts:144-163` -> `WorkerHost.notifyPermissionChanged`
+  (`worker-host.ts:1510-1525`) posts `{ type: "permission_changed", permission, granted,
+  allGranted }` (message type declared at :638-643) -> the runtime refreshes its
+  `has()` cache from `allGranted` and fires `spindle.permissions.onChanged` handlers and
+  `spindle.on("PERMISSION_CHANGED")` handlers (`src/spindle/worker-runtime.ts:4914-4958`;
+  both fire for the same message). 0.1.0 never listened, so GENERATION_ENDED (F2) and the
+  instruction interceptor (F1) stayed dead until a restart.
+- **Re-subscribe trap:** `spindle.on(event)` posts `subscribe_event` only when the
+  worker-side handler Set for that event is first created (`worker-runtime.ts:1669-1676`).
+  After a denied subscription the Set still exists, so calling `on()` again would add a
+  duplicate local handler and never reach the host. The disposer deletes an empty Set and
+  posts `unsubscribe_event` (:1678-1686), which the host treats as a no-op for a
+  never-installed subscription (`worker-host.ts:2781-2787`).
+- **Fix** (`backend.mjs` `createRegistrations`): each registration (GENERATION_ENDED /
+  `generation`, interceptor / `interceptor`, MESSAGE_EDITED / none) tracks whether it is
+  believed live — false if `permissions.has(perm)` was false when it registered (the cache
+  is seeded before extension code runs, `worker-runtime.ts:4544-4550`) or if
+  `permissions.onDenied` reports its exact `operation` string. On `permissions.onChanged`
+  (falling back to `on("PERMISSION_CHANGED")` only if `onChanged` is missing — never both),
+  a not-live registration whose permission is now in `allGranted` is disposed and
+  registered again; a live one whose permission was revoked is disposed. Live
+  registrations are left alone, so the per-permission burst never stacks registrations
+  (`registerInterceptor` would be safe either way: fresh registrationId, host replaces the
+  previous one at ~2970). The worker also pushes `{ type: "permissions_changed" }` to the
+  panel. Tests: `test/backend.test.mjs` `PERMISSION-LATE: ...` (a fake that models the
+  runtime's first-handler-only subscribe and the host's drop-on-deny).
+
+### Root cause 2 — one failed panel load disabled every control (VERIFIED by reproduction)
+
+- 0.1.0 `frontend.mjs` sent four loads (`load_settings`, `load_registry`, `load_auto`,
+  `list_images`) and set one shared `view.ready = s.ok && r.ok && a.ok && i.ok`; every
+  control was rendered `disabled` unless `ready`. `load_registry` (`characters.get`, needs
+  `characters`) and `list_images` (`chat.getMessages`, needs `chat_mutation`,
+  `worker-host.ts:3766-3769`) fail with `PERMISSION_DENIED: ...` while those permissions
+  are missing, so a panel opened before the grant showed a raw error string and nothing
+  enabled, with no retry other than closing and reopening.
+- **The modal itself is not the problem.** `test/e2e/modal.e2e.mjs` rebuilds the host's
+  `showModal` DOM (fixed backdrop, z-index 10003, blur, centered flex container — shape
+  read from `frontend/src/lib/spindle/loader.ts:1741-1830`) and drives the built
+  `dist/frontend.js` in Playwright Firefox and Chromium with `hasTouch` at 360x460. With
+  every load succeeding, 0.1.0 had 12/12 controls enabled, each the hit-test target at its
+  own center, the auto toggle sent `set_auto` on tap, and the host close button worked —
+  no overlay / pointer-events / z-index / focus-trap issue. With one load failing 0.1.0 had
+  2/11 enabled; with permissions missing 0/6, and still 0/6 after the grant.
+- **Fix:** each load is independent with its own `idle|loading|ok|error|perm` state; a
+  control is disabled only by its own section's state (settings selects <- settings; auto
+  toggle <- auto; registry rows / add <- registry; regenerate <- image list). The status
+  area names failed loads with one "다시 시도" (only failed loads are re-requested), each
+  failed section has its own retry, and a permission failure reads "권한 허용 후 다시
+  시도 — <permission> 권한이 필요합니다". The backend classifies host errors by the
+  `PERMISSION_DENIED:` prefix (`PERMISSION_DENIED_PREFIX`, lumiverse-spindle-types
+  api.d.ts:2359) and returns `permission` alongside `error`; a new `load_status` request
+  lists declared-but-ungranted permissions. Failed loads are retried automatically (one
+  debounced retry per burst) on the worker's `permissions_changed` push and on the host
+  `SPINDLE_PERMISSION_CHANGED` ws event (`frontend/src/lib/spindle/loader.ts:1489-1497`
+  routes any event name; not scoped to this extension, so it only triggers "retry what
+  failed"). Typed-but-unsaved registry text is kept in view state so these automatic
+  re-renders don't wipe it. Buttons/selects also get `touch-action: manipulation` and
+  16px inputs (as LV-DnH-Menu does). After the fix the same e2e run: one failing load
+  13/13 enabled; permissions missing 8/9 (only "+ 인물 추가" waits) and 12/12 after the
+  grant, via either signal, without reopening. Tests: `test/frontend.test.mjs`
+  `PARTIAL LOAD FAILURE ...` / `PERMISSION STATE ...`.
+
+### Root cause 3 (likely) — operator-scoped installs need an explicit userId (VERIFIED in source; this server's actual scope not checked)
+
+- `resolveEffectiveUserId` (`worker-host.ts:3430-3438`) returns the installer for a
+  user-scoped install but `""` for an operator-scoped one when the call passes no
+  userId, and these handlers then throw `userId is required for operator-scoped
+  extensions`: `characters.get`/`update` (`worker-host-content-api.ts:248-255`),
+  `chats.get` (:1049-1056), `imageGen.generateNative`
+  (`worker-host-image-gen-api.ts:223-227`), `getPromptPresets` (:340-346). Operator scope
+  is what **Import Local** — the install path in `설치방법.txt` — produces:
+  `importLocalExtensions` -> `insertExtensionFromManifest` (`manager.service.ts:~2138`,
+  INSERT at :822-823) does not set `install_scope`, so the column default `'operator'`
+  applies (`src/db/migrations/020_extension_ownership.sql:1`, `src/db/baseline.sql:338`).
+  "Install from GitHub" is also operator unless `scope: "user"` is sent
+  (`spindle.routes.ts:197-199`).
+  0.1.0 passed no userId anywhere, so on an operator-scoped install the panel's registry
+  load always failed (which, with root cause 2, disabled the whole panel even after a
+  restart), the registry silently never applied (`characterIdForChat` swallows the
+  error), and every generation failed.
+- **Fix:** the acting user is threaded through every such call — from the event
+  handler's second argument (`worker-runtime.ts` ~4626 `handler(msg.payload, msg.userId)`),
+  the interceptor's `context.userId` (`InterceptorContextDTO`, api.d.ts:136), and
+  `onFrontendMessage`'s second argument. Harmless for user-scoped installs (the host
+  ignores it). `storage` (settings) and `variables.chat` need no userId. Test:
+  `OPERATOR SCOPE: ...`.
+
+### Still UNVERIFIED on the live server
+
+- Whether `![그림:...](url)` visibly renders in the chat (source says it should, see
+  "Frontend UI" above), and whether the main/style preset visibly changes a generated
+  image.
+- Whether this server's install is actually operator-scoped (it is if it went through
+  Import Local per `설치방법.txt`; the 0.1.0 panel would then show/log `userId is required
+  for operator-scoped extensions` for the registry load — that string is the
+  discriminator).
 
 ## What was explicitly NOT done (by design, not oversight)
 

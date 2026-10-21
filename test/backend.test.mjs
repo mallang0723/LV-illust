@@ -876,3 +876,209 @@ test('REGRESSION (4th pass, finding 1): the global generation queue also has a d
   assert.ok(!msgA.content.includes('img-1'));
   assert.ok(!msgB.content.includes('img-1'));
 });
+
+// ---------------------------------------------------------------- permissions granted AFTER start
+
+// Wraps fakeApi with a model of the real worker runtime + host for the parts that matter
+// here (cited in backend.mjs createRegistrations):
+//  - `on(event)` posts `subscribe_event` to the host ONLY when that event's local handler
+//    Set is first created (worker-runtime.ts:1669-1676); its disposer deletes the Set when
+//    empty and posts `unsubscribe_event` (:1678-1686). PERMISSION_CHANGED is local-only.
+//  - the host drops a GENERATION_* subscription without `generation`, and an interceptor
+//    registration without `interceptor`, posting `permission_denied` (worker-host.ts
+//    ~2700-2715, ~2946-2956); nothing retries it.
+//  - granting posts one `permission_changed` per permission with the full allGranted list
+//    (spindle.routes.ts:493-503); the runtime refreshes its has() cache, then fires
+//    permissions.onChanged handlers (worker-runtime.ts:4914-4938).
+function runtimeApi(opts = {}, granted = []) {
+  const f = fakeApi(opts);
+  const perms = new Set(granted);
+  const local = new Map(); // event -> Set(handler)  (worker side)
+  const hostSubs = new Set(); // events the host actually forwards
+  const host = { subscribePosts: [], interceptor: null, interceptorPosts: 0, denied: [] };
+  const deniedHandlers = new Set(), changedHandlers = new Set();
+  const frontendPushes = [];
+  let frontendHandler = null;
+  let localInterceptor = null, regSeq = 0;
+  const GEN = new Set(['GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED']);
+  const deny = (permission, operation) => { host.denied.push(operation); for (const h of deniedHandlers) h({ permission, operation }); };
+  const hostSubscribe = (event) => {
+    host.subscribePosts.push(event);
+    if (GEN.has(event) && !perms.has('generation')) { deny('generation', `subscribe_event:${event}`); return; }
+    hostSubs.add(event);
+  };
+  Object.assign(f.api, {
+    on(event, handler) {
+      if (!local.has(event)) { local.set(event, new Set()); if (event !== 'PERMISSION_CHANGED') hostSubscribe(event); }
+      local.get(event).add(handler);
+      return () => {
+        local.get(event)?.delete(handler);
+        if (local.get(event)?.size === 0) { local.delete(event); if (event !== 'PERMISSION_CHANGED') hostSubs.delete(event); }
+      };
+    },
+    registerInterceptor(handler) {
+      const id = ++regSeq;
+      localInterceptor = { id, handler };
+      host.interceptorPosts++;
+      if (!perms.has('interceptor')) deny('interceptor', 'registerInterceptor');
+      else host.interceptor = { id, handler };
+      return () => {
+        if (localInterceptor?.id !== id) return;
+        localInterceptor = null;
+        if (host.interceptor?.id === id) host.interceptor = null;
+      };
+    },
+    permissions: {
+      has: (p) => perms.has(p),
+      getGranted: async () => [...perms],
+      onDenied: (h) => { deniedHandlers.add(h); return () => deniedHandlers.delete(h); },
+      onChanged: (h) => { changedHandlers.add(h); return () => changedHandlers.delete(h); },
+    },
+    onFrontendMessage: (h) => { frontendHandler = h; return () => { frontendHandler = null; }; },
+    sendToFrontend: (payload, userId, o) => { frontendPushes.push({ payload, userId, o }); },
+  });
+  const notify = (permission, isGranted) => {
+    const detail = { extensionId: 'lv_illust', permission, granted: isGranted, allGranted: [...perms] };
+    for (const h of changedHandlers) h(detail);
+  };
+  return {
+    ...f, host, hostSubs, local, frontendPushes,
+    localHandlerCount: (event) => local.get(event)?.size || 0,
+    grant(...ps) { for (const p of ps) perms.add(p); for (const p of ps) notify(p, true); },
+    revoke(...ps) { for (const p of ps) perms.delete(p); for (const p of ps) notify(p, false); },
+    // what the host does when the event actually fires: only forwarded if subscribed
+    hostEmit(event, payload, userId) { if (!hostSubs.has(event)) return false; for (const h of local.get(event) || []) h(payload, userId); return true; },
+    hostRunInterceptor: (msgs, ctx) => host.interceptor?.handler(msgs, ctx),
+    frontend: (payload, userId = 'u1') => new Promise((resolve) => {
+      const before = frontendPushes.length;
+      frontendHandler(payload, userId, 'fs1').then(() => resolve(frontendPushes[before].payload));
+    }),
+  };
+}
+
+const flush = async () => { for (let i = 0; i < 30; i++) await new Promise((r) => setTimeout(r, 0)); };
+const ALL_PERMS = ['image_gen', 'interceptor', 'chat_mutation', 'characters', 'chats', 'generation'];
+
+test('PERMISSION-LATE: started before generation/interceptor were granted -> host drops both; granting re-registers them without a restart', async () => {
+  const msg = assistantMsg('m1', '앞 <pic prompt="scene"> 뒤');
+  const r = runtimeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } }, ['image_gen', 'chat_mutation', 'characters', 'chats']);
+  const dispose = start(r.api);
+  // exactly what the server log showed at startup
+  assert.deepEqual(r.host.denied.sort(), ['registerInterceptor', 'subscribe_event:GENERATION_ENDED']);
+  assert.equal(r.hostEmit('GENERATION_ENDED', { chatId: 'c1', messageId: 'm1' }), false, 'host is not forwarding GENERATION_ENDED yet');
+  assert.equal(r.host.interceptor, null);
+
+  r.grant('generation', 'interceptor');
+  assert.equal(r.hostSubs.has('GENERATION_ENDED'), true, 'a fresh subscribe_event must reach the host after the grant');
+  assert.equal(r.localHandlerCount('GENERATION_ENDED'), 1, 'never a duplicate local handler');
+  assert.ok(r.host.interceptor, 'interceptor registered with the host after the grant');
+
+  assert.equal(r.hostEmit('GENERATION_ENDED', { chatId: 'c1', messageId: 'm1' }), true);
+  await flush();
+  assert.ok(r.calls.find((c) => c[0] === 'updateMessage'), 'GENERATION_ENDED is now handled end to end');
+  const out = await r.hostRunInterceptor([{ role: 'user', content: 'hi' }], { chatId: 'c1', characterId: null, userId: 'u1' });
+  assert.ok(Array.isArray(out) && out.length === 2, 'instruction injected by the re-registered interceptor');
+  dispose();
+});
+
+test('PERMISSION-LATE: re-registration is idempotent across a burst of permission_changed notifications', () => {
+  const r = runtimeApi({}, []);
+  start(r.api);
+  const postsAfterStart = r.host.subscribePosts.filter((e) => e === 'GENERATION_ENDED').length;
+  const intAfterStart = r.host.interceptorPosts;
+  r.grant(...ALL_PERMS); // six notifications, each carrying the full allGranted list
+  r.grant('generation'); // and a redundant one
+  r.grant('interceptor');
+  assert.equal(r.host.subscribePosts.filter((e) => e === 'GENERATION_ENDED').length, postsAfterStart + 1, 'GENERATION_ENDED re-subscribed exactly once');
+  assert.equal(r.host.interceptorPosts, intAfterStart + 1, 'interceptor re-registered exactly once');
+  assert.equal(r.localHandlerCount('GENERATION_ENDED'), 1);
+  assert.equal(r.localHandlerCount('MESSAGE_EDITED'), 1);
+  assert.equal(r.host.subscribePosts.filter((e) => e === 'MESSAGE_EDITED').length, 1, 'ungated MESSAGE_EDITED is never re-subscribed');
+});
+
+test('PERMISSION-LATE: when permissions were already granted at start nothing is re-registered by later changes', () => {
+  const r = runtimeApi({}, ALL_PERMS);
+  start(r.api);
+  assert.deepEqual(r.host.denied, []);
+  const posts = r.host.subscribePosts.length, ints = r.host.interceptorPosts;
+  r.grant('characters');
+  assert.equal(r.host.subscribePosts.length, posts);
+  assert.equal(r.host.interceptorPosts, ints);
+});
+
+test('PERMISSION-LATE: revoking unregisters, granting again re-registers once', () => {
+  const r = runtimeApi({}, ALL_PERMS);
+  start(r.api);
+  r.revoke('generation');
+  assert.equal(r.hostSubs.has('GENERATION_ENDED'), false);
+  assert.equal(r.localHandlerCount('GENERATION_ENDED'), 0);
+  r.grant('generation');
+  assert.equal(r.hostSubs.has('GENERATION_ENDED'), true);
+  assert.equal(r.localHandlerCount('GENERATION_ENDED'), 1);
+});
+
+test('PERMISSION-LATE: a permission change is pushed to the panel so it can retry failed loads', () => {
+  const r = runtimeApi({}, []);
+  start(r.api);
+  r.grant('characters');
+  const push = r.frontendPushes.find((p) => p.payload.type === 'permissions_changed');
+  assert.ok(push);
+  assert.equal(push.payload.requestId, undefined, 'a push, not a reply to any request');
+  assert.deepEqual(push.payload.allGranted, ['characters']);
+});
+
+test('PERMISSION-LATE: dispose() removes every registration and the permission listeners', () => {
+  const r = runtimeApi({}, ALL_PERMS);
+  const dispose = start(r.api);
+  dispose();
+  assert.equal(r.localHandlerCount('GENERATION_ENDED'), 0);
+  assert.equal(r.localHandlerCount('MESSAGE_EDITED'), 0);
+  assert.equal(r.host.interceptor, null);
+  const posts = r.host.subscribePosts.length;
+  r.grant('generation');
+  assert.equal(r.host.subscribePosts.length, posts, 'no re-registration after dispose');
+});
+
+test('frontend replies classify host PERMISSION_DENIED errors and load_status lists missing permissions', async () => {
+  const r = runtimeApi({}, ['image_gen', 'generation']);
+  r.api.characters.get = async () => { throw new Error('PERMISSION_DENIED: characters — Characters permission not granted'); };
+  start(r.api);
+  const reg = await r.frontend({ type: 'load_registry', characterId: 'ch1', requestId: 'q1' });
+  assert.equal(reg.ok, false);
+  assert.equal(reg.permission, 'characters');
+  assert.equal(reg.requestId, 'q1');
+  const st = await r.frontend({ type: 'load_status', requestId: 'q2' });
+  assert.deepEqual(st.missing.sort(), ['characters', 'chat_mutation', 'chats', 'interceptor']);
+  const other = await r.frontend({ type: 'nope', requestId: 'q3' });
+  assert.equal(other.ok, false);
+  assert.equal(other.permission, undefined, 'ordinary errors are not mislabelled as permission problems');
+});
+
+// ---------------------------------------------------------------- operator-scoped installs need userId
+
+test('OPERATOR SCOPE: the acting userId reaches characters/chats/imageGen calls from events, interceptor and panel', async () => {
+  const need = (u) => { if (!u) throw new Error('userId is required for operator-scoped extensions'); };
+  const msg = assistantMsg('m1', '<pic chars="아드리안" prompt="scene">');
+  const r = runtimeApi({
+    messages: { c1: [msg] },
+    chats: { c1: { id: 'c1', character_id: 'ch1' } },
+    characters: { ch1: { id: 'ch1', extensions: { lv_illust: { characters: [{ names: ['아드리안'], appearance: '1boy, silver hair', enabled: true }] } } } },
+    promptPresets: { activeId: null, presets: [] },
+  }, ALL_PERMS);
+  const origChats = r.api.chats.get, origChar = r.api.characters.get, origGen = r.api.imageGen.generateNative, origPresets = r.api.imageGen.getPromptPresets;
+  r.api.chats.get = async (id, u) => { need(u); return origChats(id); };
+  r.api.characters.get = async (id, u) => { need(u); return origChar(id); };
+  r.api.imageGen.generateNative = async (input) => { need(input.userId); return origGen(input); };
+  r.api.imageGen.getPromptPresets = async (u) => { need(u); return origPresets(u); };
+  start(r.api);
+  r.hostEmit('GENERATION_ENDED', { chatId: 'c1', messageId: 'm1' }, 'u1');
+  await flush();
+  const [, genInput] = r.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.userId, 'u1');
+  assert.deepEqual(genInput.parameters.characterTags, [{ tags: '1boy, silver hair' }], 'registry resolved with the userId (not silently empty)');
+  const reg = await r.frontend({ type: 'load_registry', characterId: 'ch1', requestId: 'q1' }, 'u1');
+  assert.equal(reg.ok, true);
+  assert.equal(reg.registry.length, 1);
+  const injected = await r.hostRunInterceptor([{ role: 'user', content: 'hi' }], { chatId: 'c1', characterId: 'ch1', userId: 'u1' });
+  assert.ok(JSON.stringify(injected).includes('아드리안'), 'interceptor roster loaded with context.userId');
+});

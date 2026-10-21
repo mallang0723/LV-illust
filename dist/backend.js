@@ -656,26 +656,40 @@ async function setAutoOn(api, chatId, on) {
   await api.variables.chat.set(chatId, AUTO_VAR_KEY, on ? '1' : '0');
 }
 
-async function loadRegistry(api, characterId) {
+// `userId` is threaded through every call whose host handler resolves the acting user
+// via `resolveEffectiveUserId` (worker-host.ts:3430-3438): for a USER-scoped install the
+// host ignores it and uses the installer; for an OPERATOR-scoped install (the default for
+// both "Install from GitHub" and Import Local — spindle.routes.ts:197-199) the host
+// THROWS "userId is required for operator-scoped extensions" when it is missing
+// (characters.get/update: worker-host-content-api.ts:248-255; chats.get: :1049-1056;
+// imageGen.generateNative: worker-host-image-gen-api.ts:223-227; getPromptPresets:
+// :340-346). The acting user comes from the event handler's 2nd argument
+// (worker-runtime.ts ~4626 `handler(msg.payload, msg.userId)`), the interceptor's
+// `context.userId` (InterceptorContextDTO), or onFrontendMessage's 2nd argument.
+function withUser(userId) {
+  return typeof userId === 'string' && userId ? userId : undefined;
+}
+
+async function loadRegistry(api, characterId, userId) {
   if (!characterId) return [];
-  const ch = await api.characters.get(characterId);
+  const ch = await api.characters.get(characterId, withUser(userId));
   return extToRegistry(ch);
 }
 
 /** Resolve the character card that owns a chat (permission: "chats"). Needed because
  *  neither GenerationEndedPayloadDTO nor ChatMessageDTO carries a character id — only
  *  ChatDTO.character_id does. */
-async function characterIdForChat(api, chatId) {
+async function characterIdForChat(api, chatId, userId) {
   try {
-    const chat = await api.chats.get(chatId);
+    const chat = await api.chats.get(chatId, withUser(userId));
     return chat?.character_id || undefined;
   } catch {
     return undefined;
   }
 }
 
-async function saveRegistry(api, characterId, registry) {
-  await api.characters.update(characterId, { extensions: { [IDENTIFIER]: { characters: registry } } });
+async function saveRegistry(api, characterId, registry, userId) {
+  await api.characters.update(characterId, { extensions: { [IDENTIFIER]: { characters: registry } } }, withUser(userId));
 }
 
 function existingImageIds(messages) {
@@ -772,10 +786,10 @@ function raceGenerateDeadline(fn, generateTimeoutMs) {
  * when non-empty, to avoid doubling with the connection's own default negative. See
  * docs/API-NOTES.md for the full citation and composition rationale.
  */
-async function fetchMainPreset(api) {
+async function fetchMainPreset(api, userId) {
   if (typeof api.imageGen.getPromptPresets !== 'function') return null; // optional on older hosts
   try {
-    const result = await api.imageGen.getPromptPresets();
+    const result = await api.imageGen.getPromptPresets(withUser(userId));
     if (!result?.activeId || !Array.isArray(result.presets)) return null;
     const preset = result.presets.find((p) => p.id === result.activeId);
     return preset ? { prompt: preset.prompt, negativePrompt: preset.negativePrompt } : null;
@@ -784,10 +798,12 @@ async function fetchMainPreset(api) {
   }
 }
 
-async function generateImage(api, { chatId, prompt, characterTags, mainPreset, generateTimeoutMs }) {
+async function generateImage(api, { chatId, prompt, characterTags, mainPreset, generateTimeoutMs, userId }) {
   const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset);
+  const uid = withUser(userId);
   const result = await queuedCall(() => api.imageGen.generateNative({
     chat_id: chatId,
+    ...(uid ? { userId: uid } : {}),
     prompt: finalPrompt,
     ...(negativePrompt !== undefined ? { negativePrompt } : {}),
     promptMode: 'custom',
@@ -942,15 +958,15 @@ export function _debugLockMapSize() {
  * in that window would be overwritten by the commit that follows). Orphan bookkeeping
  * is best-effort and now strictly follows the message commit, never precedes it.
  */
-async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs }) {
+async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs, userId }) {
   return withMessageLock(
     `${chatId}::${messageId}`,
-    (isExpired) => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired }),
+    (isExpired) => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired, userId }),
     lockTimeoutMs,
   );
 }
 
-async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired = () => false }) {
+async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired = () => false, userId }) {
   const planList = await api.chat.getMessages(chatId);
   const message = planList.find((m) => m.id === messageId);
   if (!message || message.role !== 'assistant') return { changed: false };
@@ -970,12 +986,12 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 
   // Fetched once per message-processing pass (not per tag) — the active main preset
   // can't change mid-pass, and this avoids N redundant RPCs for an N-image reply.
-  const mainPreset = jobs.length ? await fetchMainPreset(api) : null;
+  const mainPreset = jobs.length ? await fetchMainPreset(api, userId) : null;
 
   for (const job of jobs) {
     tagIndexToId.set(job.tagIndex, job.id);
     try {
-      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset, generateTimeoutMs });
+      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset, generateTimeoutMs, userId });
       markers.set(job.tagIndex, { mode: 'replace', text: renderSuccessMarker(job.id, result.imageUrl, job.summary) });
       resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
@@ -1078,29 +1094,30 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 // core.mjs's nextImageId is collision-resistant (time+random) by default; tests inject
 // a deterministic counter so assertions on exact ids stay readable and stable.
 export function createService(api, { idGenerator, lockTimeoutMs, generateTimeoutMs } = {}) {
-  async function handleGenerationEnded(payload) {
+  async function handleGenerationEnded(payload, userId) {
     if (!payload?.chatId || !payload?.messageId) return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, payload.chatId, true))) return;
-    const characterId = await characterIdForChat(api, payload.chatId);
-    const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs });
+    const characterId = await characterIdForChat(api, payload.chatId, userId);
+    const registry = await loadRegistry(api, characterId, userId);
+    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs, userId });
   }
 
-  async function handleMessageEdited(payload) {
-    // MESSAGE_EDITED's payload shape is UNVERIFIED (see docs/API-NOTES.md) — only
-    // `chatId` and `message.id` are trusted from it. Everything else (content,
-    // metadata, is_user, role) is re-read through the normalized `getMessages` shape
-    // inside processMessageInner, so a wrong guess about the raw payload's fields
-    // can't silently clobber another extension's metadata or act on stale content.
+  async function handleMessageEdited(payload, userId) {
+    // MESSAGE_EDITED's payload is `{ chatId, message }` where `message` is the host's
+    // raw stored Message row (VERIFIED: chats.service.ts:2871 `updateMessage`, also
+    // :2494, :2589, :2693 — see docs/API-NOTES.md). Only `chatId` and `message.id` are
+    // used from it; content/metadata/role are re-read through the normalized
+    // `getMessages` shape inside processMessageInner (the raw row carries `extra`, not
+    // the split-out `metadata`), so nothing acts on a stale or differently-shaped copy.
     const chatId = payload?.chatId;
     const messageId = payload?.message?.id;
     if (!chatId || !messageId) return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, chatId, true))) return;
-    const characterId = await characterIdForChat(api, chatId);
-    const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs });
+    const characterId = await characterIdForChat(api, chatId, userId);
+    const registry = await loadRegistry(api, characterId, userId);
+    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs, userId });
   }
 
   function registerInterceptor() {
@@ -1113,27 +1130,29 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
       const cleaned = messages.map((m) => (
         typeof m.content === 'string' ? { ...m, content: stripRenderedImages(m.content) } : m
       ));
-      const auto = await isAutoOn(api, context.chatId, true);
+      const auto = await isAutoOn(api, context?.chatId, true);
       if (!auto) return cleaned;
       const settings = await readSettings(api);
       let registry = [];
-      try { registry = await loadRegistry(api, context.characterId); } catch { /* best-effort */ }
+      try { registry = await loadRegistry(api, context.characterId, context?.userId); } catch { /* best-effort */ }
       return injectInstruction(cleaned, settings, registry);
     });
   }
 
-  async function runFrontendRequest(payload) {
+  async function runFrontendRequest(payload, userId) {
     switch (payload.type) {
+      case 'load_status':
+        return { missing: await missingPermissions(api) };
       case 'load_settings':
         return { settings: await readSettings(api) };
       case 'save_settings':
         await writeSettings(api, payload.settings);
         return { settings: await readSettings(api) };
       case 'load_registry':
-        return { registry: await loadRegistry(api, payload.characterId) };
+        return { registry: await loadRegistry(api, payload.characterId, userId) };
       case 'save_registry':
-        await saveRegistry(api, payload.characterId, normalizeRegistry({ characters: payload.registry }));
-        return { registry: await loadRegistry(api, payload.characterId) };
+        await saveRegistry(api, payload.characterId, normalizeRegistry({ characters: payload.registry }), userId);
+        return { registry: await loadRegistry(api, payload.characterId, userId) };
       case 'list_images': {
         const messages = await api.chat.getMessages(payload.chatId);
         const out = [];
@@ -1163,7 +1182,7 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
         if (!payload?.chatId || !payload?.messageId || !payload?.imageId) throw new Error('잘못된 요청');
         return withMessageLock(
           `${payload.chatId}::${payload.messageId}`,
-          (isExpired) => regenerateLocked(api, payload, isExpired, generateTimeoutMs),
+          (isExpired) => regenerateLocked(api, payload, isExpired, generateTimeoutMs, userId),
           lockTimeoutMs,
         );
       }
@@ -1178,7 +1197,7 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
 // Serialized under the same per-message lock as processMessage — a panel regenerate
 // and a fresh generation for the same message can no longer interleave their
 // plan/commit either.
-async function regenerateLocked(api, payload, isExpired = () => false, generateTimeoutMs) {
+async function regenerateLocked(api, payload, isExpired = () => false, generateTimeoutMs, userId) {
   const messages = await api.chat.getMessages(payload.chatId);
   const message = messages.find((m) => m.id === payload.messageId);
   if (!message) throw new Error('메시지를 찾을 수 없습니다');
@@ -1191,8 +1210,8 @@ async function regenerateLocked(api, payload, isExpired = () => false, generateT
     // Review finding 4: validate before touching anything — on failure (including an
     // unusable result), the existing marker/metadata for this image is left completely
     // untouched, so a working image is never replaced by a broken one.
-    const mainPreset = await fetchMainPreset(api);
-    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset, generateTimeoutMs });
+    const mainPreset = await fetchMainPreset(api, userId);
+    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset, generateTimeoutMs, userId });
   } catch (err) {
     throw new Error('다시 그리기 실패: ' + String(err?.message || err));
   }
@@ -1236,20 +1255,173 @@ async function regenerateLocked(api, payload, isExpired = () => false, generateT
   return { ok: true };
 }
 
+// Every permission this extension's manifest declares (spindle.json). Used only to tell
+// the panel which ones are still missing; the host remains the enforcer.
+export const MANIFEST_PERMISSIONS = ['image_gen', 'interceptor', 'chat_mutation', 'characters', 'chats', 'generation'];
+
+async function grantedPermissions(api) {
+  const perms = api.permissions;
+  if (typeof perms?.getGranted === 'function') {
+    try {
+      const list = await perms.getGranted();
+      if (Array.isArray(list)) return list;
+    } catch { /* fall through to the local cache */ }
+  }
+  if (typeof perms?.has === 'function') return MANIFEST_PERMISSIONS.filter((p) => { try { return perms.has(p); } catch { return false; } });
+  return null; // unknown (very old host) — don't claim anything is missing
+}
+
+async function missingPermissions(api) {
+  const granted = await grantedPermissions(api);
+  if (!granted) return [];
+  return MANIFEST_PERMISSIONS.filter((p) => !granted.includes(p));
+}
+
+/** Host permission errors are thrown as `PERMISSION_DENIED: <permission> — ...`
+ *  (`PERMISSION_DENIED_PREFIX`, lumiverse-spindle-types api.d.ts:2359; e.g.
+ *  worker-host.ts:3768-3769 for chat.getMessages, worker-host-content-api.ts:250-251 for
+ *  characters.get). Returns the permission name, or null for any other error. */
+export function permissionFromError(err) {
+  const m = /PERMISSION_DENIED:\s*([a-z_]+)/.exec(String(err?.message || err || ''));
+  return m ? m[1] : null;
+}
+
+/**
+ * Permission-aware registration of the event subscriptions and the interceptor.
+ *
+ * Root cause this exists for: the host checks the `generation` permission ONCE, when
+ * the worker's `subscribe_event` message arrives (worker-host.ts:2695-2715
+ * `handleSubscribeEvent`: GENERATION_ENDED is in GENERATION_EVENTS, so without the
+ * permission it logs "Generation permission required for event: GENERATION_ENDED",
+ * posts `permission_denied` and returns — the subscription is simply dropped), and the
+ * `interceptor` permission ONCE in `handleRegisterInterceptor` (worker-host.ts:2946-2956,
+ * "Interceptor permission not granted"). Neither is ever retried by the host. An
+ * extension that starts before its permissions are granted therefore never receives
+ * GENERATION_ENDED and never injects its instruction until it is restarted.
+ *
+ * Granting a permission later does reach the running worker: the permissions route
+ * (spindle.routes.ts:493-503) calls lifecycle.notifyPermissionChanged() once PER
+ * permission (lifecycle.ts:144-163) -> WorkerHost.notifyPermissionChanged
+ * (worker-host.ts:1510-1525) posts `{type:"permission_changed", permission, granted,
+ * allGranted}`, which the runtime turns into `spindle.permissions.onChanged` handlers
+ * AND `spindle.on("PERMISSION_CHANGED")` handlers (worker-runtime.ts:4914-4958 — both
+ * fire for the same message, so only ONE of the two is used here).
+ *
+ * Re-subscribing has one trap: `spindle.on(event)` only posts `subscribe_event` to the
+ * host when the worker-side handler Set for that event is first CREATED
+ * (worker-runtime.ts:1669-1676). After a denied startup subscription the Set still
+ * exists locally, so a second `on()` would just add a duplicate local handler and never
+ * reach the host. Re-registration therefore always disposes the old registration first
+ * (which deletes the empty Set and posts `unsubscribe_event` — a no-op on the host for a
+ * never-installed subscription, worker-host.ts:2781-2787) and only then calls `on()`
+ * again. `registerInterceptor` always posts a fresh registrationId and the host replaces
+ * any previous one (worker-host.ts ~2970 `this.interceptorUnregister?.()`), but it is
+ * disposed first too for symmetry.
+ *
+ * Idempotent: an entry is (re)registered only when it is not believed live, so the burst
+ * of one permission_changed per granted permission never stacks registrations.
+ */
+export function createRegistrations(api, service) {
+  const perms = api.permissions;
+  const hasPerm = (p) => {
+    if (!p) return true;
+    if (typeof perms?.has !== 'function') return true; // no cache to consult — assume the host accepted it
+    try { return perms.has(p) === true; } catch { return true; }
+  };
+  const onEvent = (handler) => (payload, userId) => { handler(payload, userId).catch((e) => console.error('[lv_illust]', e)); };
+  const entries = [
+    { name: 'GENERATION_ENDED', permission: 'generation', deniedOp: 'subscribe_event:GENERATION_ENDED',
+      register: () => api.on('GENERATION_ENDED', onEvent(service.handleGenerationEnded)) },
+    { name: 'MESSAGE_EDITED', permission: null, deniedOp: 'subscribe_event:MESSAGE_EDITED',
+      register: () => api.on('MESSAGE_EDITED', onEvent(service.handleMessageEdited)) },
+    { name: 'interceptor', permission: 'interceptor', deniedOp: 'registerInterceptor',
+      register: () => service.registerInterceptor() },
+  ].map((e) => ({ ...e, off: null, live: false, attempts: 0 }));
+
+  function detach(e) {
+    if (e.off) { try { e.off(); } catch { /* ignore */ } }
+    e.off = null;
+    e.live = false;
+  }
+  function attach(e) {
+    detach(e); // see the trap above: dispose first, or the host never hears about it
+    e.attempts++;
+    try {
+      const off = e.register();
+      e.off = typeof off === 'function' ? off : null;
+      // If the permission is missing right now the host drops this registration (and
+      // says so via permission_denied) — remember to retry once it is granted.
+      e.live = hasPerm(e.permission);
+    } catch (err) {
+      e.off = null; e.live = false;
+      console.error(`[lv_illust] registering ${e.name} failed`, err);
+    }
+  }
+
+  for (const e of entries) attach(e);
+
+  // Direct signal from the host that a registration was dropped (worker-host.ts ~2708-2712
+  // and ~2950-2955 post exactly these `operation` strings).
+  let offDenied = () => {};
+  if (typeof perms?.onDenied === 'function') {
+    offDenied = perms.onDenied((detail) => {
+      for (const e of entries) if (detail?.operation === e.deniedOp) e.live = false;
+    }) || offDenied;
+  }
+
+  function onPermissionChanged(detail) {
+    const all = Array.isArray(detail?.allGranted) ? detail.allGranted : null;
+    const granted = (p) => (all ? all.includes(p) : hasPerm(p));
+    for (const e of entries) {
+      if (!e.permission) {
+        if (!e.live) attach(e);
+        continue;
+      }
+      if (granted(e.permission)) {
+        if (!e.live) attach(e);
+        if (all) e.live = true; // allGranted is authoritative (worker-runtime.ts:4921-4923)
+      } else if (e.live) {
+        detach(e); // revoked: stop acting on it; a later grant re-registers
+      }
+    }
+    // Let an open panel retry whatever failed for lack of permission, without a reload.
+    try {
+      api.sendToFrontend({ type: 'permissions_changed', permission: detail?.permission, granted: detail?.granted, allGranted: all || undefined });
+    } catch { /* no frontend connected */ }
+  }
+
+  let offChanged = () => {};
+  if (typeof perms?.onChanged === 'function') offChanged = perms.onChanged(onPermissionChanged) || offChanged;
+  else if (typeof api.on === 'function') offChanged = api.on('PERMISSION_CHANGED', onPermissionChanged) || offChanged;
+
+  return {
+    onPermissionChanged,
+    state: () => Object.fromEntries(entries.map((e) => [e.name, { live: e.live, attempts: e.attempts, registered: !!e.off }])),
+    dispose() {
+      try { offChanged(); } catch { /* ignore */ }
+      try { offDenied(); } catch { /* ignore */ }
+      for (const e of entries) detach(e);
+    },
+  };
+}
+
 export function start(api) {
   const service = createService(api);
-  const offs = [];
-  offs.push(api.on('GENERATION_ENDED', (payload) => { service.handleGenerationEnded(payload).catch((e) => console.error('[lv_illust]', e)); }));
-  offs.push(api.on('MESSAGE_EDITED', (payload) => { service.handleMessageEdited(payload).catch((e) => console.error('[lv_illust]', e)); }));
-  offs.push(service.registerInterceptor());
-  offs.push(api.onFrontendMessage(async (payload, userId, frontendSessionId) => {
+  const registrations = createRegistrations(api, service);
+  const offFrontend = api.onFrontendMessage(async (payload, userId, frontendSessionId) => {
     if (!payload || typeof payload.requestId !== 'string') return;
     let reply;
-    try { reply = { ok: true, ...(await service.runFrontendRequest(payload)) }; }
-    catch (e) { reply = { ok: false, error: String(e?.message || e) }; }
+    try { reply = { ok: true, ...(await service.runFrontendRequest(payload, userId)) }; }
+    catch (e) {
+      const permission = permissionFromError(e);
+      reply = { ok: false, error: String(e?.message || e), ...(permission ? { permission } : {}) };
+    }
     api.sendToFrontend({ ...reply, requestId: payload.requestId, type: payload.type }, userId, frontendSessionId ? { frontendSessionId } : undefined);
-  }));
-  return () => { for (const off of offs) { try { off(); } catch { /* ignore */ } } };
+  });
+  return () => {
+    registrations.dispose();
+    try { offFrontend(); } catch { /* ignore */ }
+  };
 }
 
 if (typeof spindle !== 'undefined') start(spindle);
