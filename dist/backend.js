@@ -46,29 +46,48 @@ function scanTag(text, openIdx) {
   }
 }
 
-// Review (3rd pass) finding 1: idempotency for malformed tags must come from the
-// CONTENT itself, not a side list (a capped metadata list evicts old entries while the
-// physical annotation stays in the message forever, causing endless re-annotation once
-// the distinct-malformed-tag count exceeds the cap — reproduced at 51 distinct tags /
-// 110 passes). Content-based check: if our fixed marker text is found immediately
-// after a malformed span, that occurrence has already been annotated — skip it
-// entirely (no new marker, `end` advances past the existing marker so it's never
-// re-included in a later span). No list, no cap, correct regardless of how many
-// malformed tags exist or how many passes run.
-function checkAnnotated(text, end) {
-  if (text.startsWith(MALFORMED_MARKER_TEXT, end)) {
-    return { annotated: true, end: end + MALFORMED_MARKER_TEXT.length };
-  }
-  return { annotated: false, end };
+// Review (4th pass) finding 2: the previous (3rd pass) fix computed a "malformed span"
+// heuristically (nearest '>', else nearest '<', else a 300-char bound) and checked for
+// our marker text immediately *after* that computed span. That still broke for
+// `<pic prompt="unfinished` + nothing closing: `scanTag`'s own unterminated-value scan
+// only stops at `"` or `<` — neither appears in our marker text — so on the SECOND
+// parse, the "unterminated value" scan read straight through the previously-inserted
+// marker as if it were more of the (still-unterminated) attribute value, which moved
+// where the span was computed to "end" on every pass, so the annotated-marker check
+// (looking right at that ever-shifting position) never found the marker that was
+// actually sitting further back — reproduced: 10 writes, a second marker nested inside
+// the first. Fixed structurally instead of heuristically: the marker is now inserted
+// immediately after the literal 4-character `<pic` opener itself (before ANY of the
+// tag's own attribute text), and it starts with a character — `⟦`, see
+// MALFORMED_MARKER_TEXT below — that is neither whitespace nor `>`. That means the very
+// first check below (`boundary = text[idx+4]`) rejects this `<pic` occurrence as "not a
+// tag opener" on every later parse, for the exact same reason `<pic-failed` already
+// was rejected — `scanTag` (and therefore the unterminated-value-scanning that caused
+// the bug) is never even invoked on it again. No span, no bound, no heuristic: a
+// malformed tag returned by this function is *always* one that has not been annotated
+// yet, because an annotated one can no longer be recognized as a `<pic` tag at all.
+//
+// The anchor text used for *relocation* (finding a malformed tag again in possibly-
+// changed content before splicing — see backend.mjs) is now just a short, fixed-length
+// prefix starting at the tag; it carries no significance beyond "a reasonably unique
+// search key" and is never used to decide where content ends or where the marker goes
+// (that's always exactly 4 characters into wherever the anchor is found).
+const MALFORMED_ANCHOR_LEN = 32;
+
+function buildMalformedTag(text, idx) {
+  const raw = text.slice(idx, Math.min(idx + MALFORMED_ANCHOR_LEN, text.length));
+  return { start: idx, end: idx + 4, raw, malformed: true, charsRaw: '', promptRaw: '' };
 }
 
 /**
  * Find every `<pic ...>` occurrence in `content` (well-formed tags, parsed; malformed
  * ones flagged) in document order, non-overlapping. Already-rendered markers
- * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`, and an already-annotated
- * malformed tag's marker) never start a new match of their own (nothing there starts
- * with `<pic` followed by whitespace/`>`), so re-running this on an already-processed
- * message is a no-op — satisfies "never re-process already-rendered images".
+ * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`) and already-annotated
+ * malformed tags never start a new match of their own — nothing there starts with
+ * `<pic` followed by whitespace/`>` — so re-running this on an already-processed
+ * message is a no-op — satisfies "never re-process already-rendered images", and a
+ * malformed tag this function returns is *always* new (never already annotated; see
+ * above).
  */
 export function parseTags(content) {
   const text = String(content ?? '');
@@ -79,7 +98,8 @@ export function parseTags(content) {
     if (idx === -1) break;
     const boundary = text[idx + 4];
     if (boundary !== undefined && boundary !== '>' && !WS.test(boundary)) {
-      // e.g. "<pic-failed" — not our tag at all, keep scanning
+      // e.g. "<pic-failed", or an already-annotated malformed tag (our marker's first
+      // character is deliberately neither whitespace nor '>') — not our tag, skip it.
       searchFrom = idx + 4;
       continue;
     }
@@ -88,44 +108,22 @@ export function parseTags(content) {
       const { attrs } = scanned;
       const hasChars = Object.prototype.hasOwnProperty.call(attrs, 'chars');
       const hasPrompt = Object.prototype.hasOwnProperty.call(attrs, 'prompt');
-      const malformed = !hasChars && !hasPrompt;
-      const raw = text.slice(idx, scanned.end);
-      const { annotated, end } = malformed ? checkAnnotated(text, scanned.end) : { annotated: false, end: scanned.end };
+      if (!hasChars && !hasPrompt) {
+        const tag = buildMalformedTag(text, idx);
+        out.push(tag);
+        searchFrom = tag.end;
+        continue;
+      }
       out.push({
-        start: idx, end, raw, malformed, annotated,
-        charsRaw: hasChars ? attrs.chars : '',
-        promptRaw: hasPrompt ? attrs.prompt : '',
+        start: idx, end: scanned.end, raw: text.slice(idx, scanned.end), malformed: false,
+        charsRaw: hasChars ? attrs.chars : '', promptRaw: hasPrompt ? attrs.prompt : '',
       });
-      searchFrom = end;
+      searchFrom = scanned.end;
     } else {
       // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
-      //
-      // This span is now ONLY used to (a) decide where to insert an annotation / detect
-      // an existing one and (b) decide where to resume scanning for more `<pic`
-      // occurrences — it is NEVER used to delete/replace anything (see
-      // planMessage/renderMalformedMarker: malformed handling only ever INSERTS a short
-      // marker after the untouched original text, never replaces it). Still bounded to
-      // a small span regardless of which branch is taken — review (2nd pass) finding 1
-      // caught that the `nextLt` fallback below had NO bound at all, so a broken tag
-      // followed by a long stretch of real narrative and then any later '<' (even a
-      // genuine later tag far down the message) made `tag.raw` swallow all of that
-      // narrative. Capping every branch at BOUND avoids that regardless of what used to
-      // (and no longer does) happen to the swallowed text.
-      const BOUND = 300;
-      const nextLt = text.indexOf('<', idx + 4);
-      const nextGt = text.indexOf('>', idx + 4);
-      let rawEnd;
-      if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
-        rawEnd = nextGt + 1; // include the stray '>' — the broken tag's apparent close
-      } else if (nextLt !== -1 && nextLt - idx <= BOUND) {
-        rawEnd = nextLt; // stop before whatever starts next (often a later real tag)
-      } else {
-        rawEnd = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
-      }
-      const raw = text.slice(idx, rawEnd);
-      const { annotated, end } = checkAnnotated(text, rawEnd);
-      out.push({ start: idx, end, raw, malformed: true, annotated, charsRaw: '', promptRaw: '' });
-      searchFrom = end;
+      const tag = buildMalformedTag(text, idx);
+      out.push(tag);
+      searchFrom = tag.end;
     }
   }
   return out;
@@ -374,11 +372,21 @@ export function renderSkippedMarker(id, tag) {
 // the previous version REPLACED the malformed span with a marker that re-summarized
 // (and therefore truncated/destroyed) the original text. The fixed design never
 // replaces anything for a malformed tag: this fixed, short marker is only ever
-// INSERTED immediately *after* the untouched original text (see planMessage's
-// `{mode:'insert', ...}` entries and backend.mjs's splice loop), so message length can
-// only grow, never shrink, because of malformed-tag handling. No `tag` data is embedded
+// INSERTED immediately *after* the literal `<pic` opener (see planMessage's
+// `{mode:'insert', ...}` entries and backend.mjs's splice loop — always exactly 4
+// characters into wherever the tag's anchor is found), so message length can only
+// grow, never shrink, because of malformed-tag handling. No `tag` data is embedded
 // (nothing to escape, nothing to summarize — the real text is right there, intact).
-export const MALFORMED_MARKER_TEXT = ' [⚠️ 그림 태그 형식 오류 — 고치면 다시 시도됩니다]';
+//
+// Review (4th pass) finding 2: this text must start with a character that is neither
+// whitespace nor '>' — `parseTags`'s boundary check (`boundary = text[idx+4]`) relies
+// on that to recognize an annotated tag as "not a `<pic` opener" on every later parse,
+// without needing to locate or compare against this marker at all (see buildMalformedTag
+// above). A leading space here would defeat that: whitespace right after `<pic` still
+// passes the boundary check as "maybe our tag", so `scanTag` would run again and the
+// bug this marker exists to prevent would resurface. `⟦`/`⟧` (not `<`/`>`) are used so
+// the marker itself can never be mistaken for tag syntax either.
+export const MALFORMED_MARKER_TEXT = '⟦삽화가: 그림 태그 형식 오류 — 고치면 다시 시도됩니다⟧';
 export function renderMalformedMarker() {
   return MALFORMED_MARKER_TEXT;
 }
@@ -409,11 +417,12 @@ export function planMessage(content, { registry = [], maxImages = 2, existingIma
   let validCount = 0;
   tags.forEach((tag, i) => {
     if (tag.malformed) {
-      // Review (3rd pass) finding 1: idempotency is now a property of `tag.annotated`
-      // (content-based, computed by parseTags itself — see checkAnnotated) rather than
-      // a side list here, so there is nothing to cap and nothing that can drift out of
-      // sync with what's actually in the message.
-      if (!tag.annotated) markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
+      // Review (4th pass) finding 2: parseTags structurally never returns an
+      // already-annotated malformed tag (see buildMalformedTag) — an annotated
+      // occurrence can no longer even be recognized as a `<pic` tag, so it's filtered
+      // out before parseTags ever reaches the point of flagging it malformed. Every
+      // malformed tag reaching here is therefore guaranteed to need a new marker.
+      markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
       return;
     }
     validCount++;
@@ -685,11 +694,36 @@ function existingImageIds(messages) {
 // Serializes every spindle.imageGen.generateNative() call behind one promise chain,
 // across concurrent GENERATION_ENDED/MESSAGE_EDITED handlers and panel regenerate
 // requests alike — SharedNAI only has one generation slot (design §4 "동시 생성 1개").
+//
+// Review (4th pass) finding 1: this queue needs the same kind of deadline as the
+// per-message lock, for the same reason — a single hung generate() call would
+// otherwise block every later queued generation (for ANY message) forever. Each
+// queued call is raced against `GENERATE_TIMEOUT_MS` (5 min); whichever settles first
+// is what the chain uses to unblock the NEXT queued call. On timeout, the race
+// REJECTS, so the caller (`generateImage`) sees it as an ordinary generation failure —
+// already handled by the existing try/catch in processMessageInner/regenerateLocked,
+// which never writes a failure result without re-validating first. The late real
+// result (if the hung call eventually resolves) is simply never awaited by anything —
+// discarded, never written — because whoever was waiting on it has already moved on
+// and recorded a failure/orphan instead.
+const DEFAULT_GENERATE_TIMEOUT_MS = 5 * 60 * 1000;
 let generateQueue = Promise.resolve();
-function queuedCall(fn) {
-  const result = generateQueue.then(fn, fn);
+function queuedCall(fn, generateTimeoutMs = DEFAULT_GENERATE_TIMEOUT_MS) {
+  const run = () => raceGenerateDeadline(fn, generateTimeoutMs);
+  const result = generateQueue.then(run, run);
   generateQueue = result.then(() => undefined, () => undefined);
   return result;
+}
+
+function raceGenerateDeadline(fn, generateTimeoutMs) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`이미지 생성 요청이 ${generateTimeoutMs}ms 내에 끝나지 않아 대기열 진행을 위해 포기함`));
+    }, generateTimeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([Promise.resolve().then(fn), deadline]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -750,7 +784,7 @@ async function fetchMainPreset(api) {
   }
 }
 
-async function generateImage(api, { chatId, prompt, characterTags, mainPreset }) {
+async function generateImage(api, { chatId, prompt, characterTags, mainPreset, generateTimeoutMs }) {
   const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset);
   const result = await queuedCall(() => api.imageGen.generateNative({
     chat_id: chatId,
@@ -760,7 +794,7 @@ async function generateImage(api, { chatId, prompt, characterTags, mainPreset })
     skipParse: true,
     parameters: { characterTags },
     includeDataUrl: false,
-  }));
+  }), generateTimeoutMs);
   // Review finding 4: the host can resolve `generate()`/`generateNative()`
   // successfully while persistence silently failed internally
   // (worker-host-image-gen-api.ts:180-206 catches that and still resolves); `imageId`/
@@ -828,30 +862,45 @@ async function pushOrphans(api, chatId, entries) {
 //
 // (b) No deadline anywhere in the chain: a predecessor operation that hangs (a stuck
 // RPC with no timeout of its own) blocks every later operation queued for that same
-// message forever. Fixed: every operation is raced against a fixed deadline
-// (`lockTimeoutMs`, default 3 minutes); whichever finishes first is what the NEXT
-// queued operation sees as "done". If the deadline wins, this call's own effect is
-// simply never awaited further (nothing it was about to write has been written yet in
-// the common case, since processMessageInner's one and only write happens after every
-// await it needs completes) and the key is freed for the next queued caller. This does
-// NOT cancel the underlying operation (no cancellation primitive is plumbed through
-// arbitrary host RPCs) — if it eventually completes after its result was already
-// discarded, it could still perform its own write uncoordinated with whatever runs
-// next; this residual risk is called out in docs/API-NOTES.md rather than silently
-// assumed away.
+// message forever. A fixed deadline (`lockTimeoutMs`, default 3 minutes) lets the NEXT
+// queued operation proceed once it elapses.
+//
+// Review (4th pass) finding 1 (regression): the first version of (b) just raced the
+// operation's promise against a timer and let the NEXT operation start as soon as
+// either settled — but racing a promise never cancels the loser. The original
+// (expired) operation kept running in the background and, having already passed its
+// own revalidation checks before the deadline fired, still called `chat.updateMessage`
+// later — overwriting whatever the SECOND (successful) operation had since committed:
+// its image, the user's own intervening edits, and unrelated metadata. Reproduced:
+// pause an operation right before its final read, let its deadline elapse, let a
+// second operation for the same message run and commit, then resume the first — the
+// first's write clobbered everything the second had just written.
+//
+// Fixed: every locked operation now receives an `isExpired()` function (see
+// processMessageInner/regenerateLocked) and MUST check it immediately before every
+// write (`chat.updateMessage`, `variables.chat.set` via pushOrphans) and abort without
+// writing if it's already expired — in addition to the existing re-read-and-revalidate
+// immediately before committing. This still cannot truly CANCEL a hung RPC the
+// operation is awaiting *when* it expires (e.g. a stuck `generateNative` call) — the
+// checks only stop the operation from writing once control returns to it — but it
+// closes the actual data-loss hole: by the time an expired operation reaches a write,
+// it now always finds out it's expired and bails out first.
 const DEFAULT_LOCK_TIMEOUT_MS = 3 * 60 * 1000;
 const messageLocks = new Map();
 
 function raceWithDeadline(fn, key, lockTimeoutMs) {
   let timer;
+  let expired = false;
+  const isExpired = () => expired;
   const deadline = new Promise((resolve) => {
     timer = setTimeout(() => {
-      console.error(`[lv_illust] message lock for "${key}" timed out after ${lockTimeoutMs}ms — releasing it for the next queued operation; this operation's own result (if it still completes later) is discarded and the message is left as-is`);
+      expired = true;
+      console.error(`[lv_illust] message lock for "${key}" timed out after ${lockTimeoutMs}ms — releasing it for the next queued operation; this operation now aborts on its next write-point if it's still running, but can't be cancelled mid-flight`);
       resolve(undefined);
     }, lockTimeoutMs);
     if (typeof timer.unref === 'function') timer.unref(); // never keep the process alive just for this
   });
-  return Promise.race([Promise.resolve().then(fn), deadline]).finally(() => clearTimeout(timer));
+  return Promise.race([Promise.resolve().then(() => fn(isExpired)), deadline]).finally(() => clearTimeout(timer));
 }
 
 function withMessageLock(key, fn, lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS) {
@@ -893,11 +942,15 @@ export function _debugLockMapSize() {
  * in that window would be overwritten by the commit that follows). Orphan bookkeeping
  * is best-effort and now strictly follows the message commit, never precedes it.
  */
-async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs }) {
-  return withMessageLock(`${chatId}::${messageId}`, () => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }), lockTimeoutMs);
+async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs }) {
+  return withMessageLock(
+    `${chatId}::${messageId}`,
+    (isExpired) => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired }),
+    lockTimeoutMs,
+  );
 }
 
-async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }) {
+async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired = () => false }) {
   const planList = await api.chat.getMessages(chatId);
   const message = planList.find((m) => m.id === messageId);
   if (!message || message.role !== 'assistant') return { changed: false };
@@ -922,7 +975,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   for (const job of jobs) {
     tagIndexToId.set(job.tagIndex, job.id);
     try {
-      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset });
+      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset, generateTimeoutMs });
       markers.set(job.tagIndex, { mode: 'replace', text: renderSuccessMarker(job.id, result.imageUrl, job.summary) });
       resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
@@ -940,6 +993,9 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 
   // --- everything above only decided *what* to do; everything below re-checks the
   // live message right before writing anything, and commits before any further RPCs. ---
+  // Review (4th pass) finding 1: an expired (past its lock deadline) operation must
+  // never write — checked immediately before every write point below, not just once.
+  if (isExpired()) return { changed: false, expired: true };
   const freshList = await api.chat.getMessages(chatId);
   const fresh = freshList.find((m) => m.id === messageId);
   const swipeChanged = !fresh || (fresh.swipe_id ?? 0) !== (message.swipe_id ?? 0);
@@ -948,7 +1004,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
       id, messageId, ts: Date.now(),
       reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...r,
     }));
-    if (orphans.length) await pushOrphans(api, chatId, orphans);
+    if (orphans.length && !isExpired()) await pushOrphans(api, chatId, orphans);
     return { changed: false, orphaned: orphans.length };
   }
 
@@ -973,7 +1029,15 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
       return;
     }
     if (entry.mode === 'insert') {
-      const insertAt = at + tag.raw.length;
+      // Review (4th pass) finding 2: malformed tags' `tag.raw` is now just a short,
+      // fixed-length RELOCATION anchor (see core.mjs buildMalformedTag) — the actual
+      // insertion point is always exactly 4 characters into wherever that anchor is
+      // found (right after the literal "<pic" opener), never "after the whole anchor".
+      // This was the one place still using the old `at + tag.raw.length` arithmetic,
+      // which silently reintroduced the bug this fix exists to prevent (reproduced:
+      // repeated writes at the backend/integration level even though core.mjs's own
+      // parseTags/applyMarkers were already fully idempotent).
+      const insertAt = at + 4;
       content = content.slice(0, insertAt) + entry.text + content.slice(insertAt);
       cursor = insertAt + entry.text.length;
       placedMalformedCount++;
@@ -991,10 +1055,14 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   if (noContentChange && noNewImages && noNewMalformed) {
     // nothing could be placed at all (everything orphaned/already-annotated) — don't
     // write an otherwise-identical copy of content/metadata back over what's there now.
-    if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
+    if (orphanedNow.length && !isExpired()) await pushOrphans(api, chatId, orphanedNow);
     return { changed: false, orphaned: orphanedNow.length };
   }
 
+  // Last check immediately before the actual commit — this is the exact write the
+  // reviewer's reproduction exploited (everything up to here can take arbitrarily long
+  // via the generate loop's awaits, so the deadline may have already fired).
+  if (isExpired()) return { changed: false, expired: true };
   const currentImages = fresh.metadata?.[IDENTIFIER]?.images || {};
   await api.chat.updateMessage(chatId, messageId, {
     content,
@@ -1002,21 +1070,21 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   });
   // Orphan bookkeeping strictly AFTER the message commit (review finding 2) — never
   // between the revalidating read and the write.
-  if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
+  if (orphanedNow.length && !isExpired()) await pushOrphans(api, chatId, orphanedNow);
   return { changed: true, content, orphaned: orphanedNow.length };
 }
 
 // `idGenerator` is a test-only hook (never passed in production — see start() below):
 // core.mjs's nextImageId is collision-resistant (time+random) by default; tests inject
 // a deterministic counter so assertions on exact ids stay readable and stable.
-export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
+export function createService(api, { idGenerator, lockTimeoutMs, generateTimeoutMs } = {}) {
   async function handleGenerationEnded(payload) {
     if (!payload?.chatId || !payload?.messageId) return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, payload.chatId, true))) return;
     const characterId = await characterIdForChat(api, payload.chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs });
+    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs });
   }
 
   async function handleMessageEdited(payload) {
@@ -1032,7 +1100,7 @@ export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
     if (!(await isAutoOn(api, chatId, true))) return;
     const characterId = await characterIdForChat(api, chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs });
+    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs });
   }
 
   function registerInterceptor() {
@@ -1093,7 +1161,11 @@ export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
         return { auto: await isAutoOn(api, payload.chatId, true) };
       case 'regenerate': {
         if (!payload?.chatId || !payload?.messageId || !payload?.imageId) throw new Error('잘못된 요청');
-        return withMessageLock(`${payload.chatId}::${payload.messageId}`, () => regenerateLocked(api, payload), lockTimeoutMs);
+        return withMessageLock(
+          `${payload.chatId}::${payload.messageId}`,
+          (isExpired) => regenerateLocked(api, payload, isExpired, generateTimeoutMs),
+          lockTimeoutMs,
+        );
       }
       default:
         throw new Error('알 수 없는 요청');
@@ -1106,7 +1178,7 @@ export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
 // Serialized under the same per-message lock as processMessage — a panel regenerate
 // and a fresh generation for the same message can no longer interleave their
 // plan/commit either.
-async function regenerateLocked(api, payload) {
+async function regenerateLocked(api, payload, isExpired = () => false, generateTimeoutMs) {
   const messages = await api.chat.getMessages(payload.chatId);
   const message = messages.find((m) => m.id === payload.messageId);
   if (!message) throw new Error('메시지를 찾을 수 없습니다');
@@ -1120,30 +1192,40 @@ async function regenerateLocked(api, payload) {
     // unusable result), the existing marker/metadata for this image is left completely
     // untouched, so a working image is never replaced by a broken one.
     const mainPreset = await fetchMainPreset(api);
-    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset });
+    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset, generateTimeoutMs });
   } catch (err) {
     throw new Error('다시 그리기 실패: ' + String(err?.message || err));
   }
 
+  // Review (4th pass) finding 1: the generate() call above can take long enough for
+  // this operation's own lock deadline to elapse while it was awaiting — check before
+  // every write point below, not just once, same as processMessageInner.
+  if (isExpired()) return { ok: false, expired: true };
   const freshList = await api.chat.getMessages(payload.chatId);
   const fresh = freshList.find((m) => m.id === payload.messageId);
   const updated = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
   if (!fresh || (fresh.swipe_id ?? 0) !== originalSwipeId) {
-    await pushOrphans(api, payload.chatId, [{
-      id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
-      reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...updated,
-    }]);
+    if (!isExpired()) {
+      await pushOrphans(api, payload.chatId, [{
+        id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+        reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...updated,
+      }]);
+    }
     throw new Error('다시 그리는 동안 메시지가 바뀌어 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
   }
   const marker = renderSuccessMarker(payload.imageId, result.imageUrl, rec.summary);
   const re = markerRegexForId(payload.imageId);
   if (!re.test(fresh.content)) {
-    await pushOrphans(api, payload.chatId, [{
-      id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
-      reason: '그림 자리(태그)가 수정되어 넣지 못함', ...updated,
-    }]);
+    if (!isExpired()) {
+      await pushOrphans(api, payload.chatId, [{
+        id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+        reason: '그림 자리(태그)가 수정되어 넣지 못함', ...updated,
+      }]);
+    }
     throw new Error('그림 자리를 찾지 못해 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
   }
+  // Last check immediately before the actual commit (same rationale as processMessageInner).
+  if (isExpired()) return { ok: false, expired: true };
   const newContent = fresh.content.replace(re, marker);
   const currentImages = { ...(fresh.metadata?.[IDENTIFIER]?.images || {}) };
   currentImages[payload.imageId] = updated;

@@ -91,11 +91,36 @@ function existingImageIds(messages) {
 // Serializes every spindle.imageGen.generateNative() call behind one promise chain,
 // across concurrent GENERATION_ENDED/MESSAGE_EDITED handlers and panel regenerate
 // requests alike — SharedNAI only has one generation slot (design §4 "동시 생성 1개").
+//
+// Review (4th pass) finding 1: this queue needs the same kind of deadline as the
+// per-message lock, for the same reason — a single hung generate() call would
+// otherwise block every later queued generation (for ANY message) forever. Each
+// queued call is raced against `GENERATE_TIMEOUT_MS` (5 min); whichever settles first
+// is what the chain uses to unblock the NEXT queued call. On timeout, the race
+// REJECTS, so the caller (`generateImage`) sees it as an ordinary generation failure —
+// already handled by the existing try/catch in processMessageInner/regenerateLocked,
+// which never writes a failure result without re-validating first. The late real
+// result (if the hung call eventually resolves) is simply never awaited by anything —
+// discarded, never written — because whoever was waiting on it has already moved on
+// and recorded a failure/orphan instead.
+const DEFAULT_GENERATE_TIMEOUT_MS = 5 * 60 * 1000;
 let generateQueue = Promise.resolve();
-function queuedCall(fn) {
-  const result = generateQueue.then(fn, fn);
+function queuedCall(fn, generateTimeoutMs = DEFAULT_GENERATE_TIMEOUT_MS) {
+  const run = () => raceGenerateDeadline(fn, generateTimeoutMs);
+  const result = generateQueue.then(run, run);
   generateQueue = result.then(() => undefined, () => undefined);
   return result;
+}
+
+function raceGenerateDeadline(fn, generateTimeoutMs) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`이미지 생성 요청이 ${generateTimeoutMs}ms 내에 끝나지 않아 대기열 진행을 위해 포기함`));
+    }, generateTimeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([Promise.resolve().then(fn), deadline]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -156,7 +181,7 @@ async function fetchMainPreset(api) {
   }
 }
 
-async function generateImage(api, { chatId, prompt, characterTags, mainPreset }) {
+async function generateImage(api, { chatId, prompt, characterTags, mainPreset, generateTimeoutMs }) {
   const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset);
   const result = await queuedCall(() => api.imageGen.generateNative({
     chat_id: chatId,
@@ -166,7 +191,7 @@ async function generateImage(api, { chatId, prompt, characterTags, mainPreset })
     skipParse: true,
     parameters: { characterTags },
     includeDataUrl: false,
-  }));
+  }), generateTimeoutMs);
   // Review finding 4: the host can resolve `generate()`/`generateNative()`
   // successfully while persistence silently failed internally
   // (worker-host-image-gen-api.ts:180-206 catches that and still resolves); `imageId`/
@@ -234,30 +259,45 @@ async function pushOrphans(api, chatId, entries) {
 //
 // (b) No deadline anywhere in the chain: a predecessor operation that hangs (a stuck
 // RPC with no timeout of its own) blocks every later operation queued for that same
-// message forever. Fixed: every operation is raced against a fixed deadline
-// (`lockTimeoutMs`, default 3 minutes); whichever finishes first is what the NEXT
-// queued operation sees as "done". If the deadline wins, this call's own effect is
-// simply never awaited further (nothing it was about to write has been written yet in
-// the common case, since processMessageInner's one and only write happens after every
-// await it needs completes) and the key is freed for the next queued caller. This does
-// NOT cancel the underlying operation (no cancellation primitive is plumbed through
-// arbitrary host RPCs) — if it eventually completes after its result was already
-// discarded, it could still perform its own write uncoordinated with whatever runs
-// next; this residual risk is called out in docs/API-NOTES.md rather than silently
-// assumed away.
+// message forever. A fixed deadline (`lockTimeoutMs`, default 3 minutes) lets the NEXT
+// queued operation proceed once it elapses.
+//
+// Review (4th pass) finding 1 (regression): the first version of (b) just raced the
+// operation's promise against a timer and let the NEXT operation start as soon as
+// either settled — but racing a promise never cancels the loser. The original
+// (expired) operation kept running in the background and, having already passed its
+// own revalidation checks before the deadline fired, still called `chat.updateMessage`
+// later — overwriting whatever the SECOND (successful) operation had since committed:
+// its image, the user's own intervening edits, and unrelated metadata. Reproduced:
+// pause an operation right before its final read, let its deadline elapse, let a
+// second operation for the same message run and commit, then resume the first — the
+// first's write clobbered everything the second had just written.
+//
+// Fixed: every locked operation now receives an `isExpired()` function (see
+// processMessageInner/regenerateLocked) and MUST check it immediately before every
+// write (`chat.updateMessage`, `variables.chat.set` via pushOrphans) and abort without
+// writing if it's already expired — in addition to the existing re-read-and-revalidate
+// immediately before committing. This still cannot truly CANCEL a hung RPC the
+// operation is awaiting *when* it expires (e.g. a stuck `generateNative` call) — the
+// checks only stop the operation from writing once control returns to it — but it
+// closes the actual data-loss hole: by the time an expired operation reaches a write,
+// it now always finds out it's expired and bails out first.
 const DEFAULT_LOCK_TIMEOUT_MS = 3 * 60 * 1000;
 const messageLocks = new Map();
 
 function raceWithDeadline(fn, key, lockTimeoutMs) {
   let timer;
+  let expired = false;
+  const isExpired = () => expired;
   const deadline = new Promise((resolve) => {
     timer = setTimeout(() => {
-      console.error(`[lv_illust] message lock for "${key}" timed out after ${lockTimeoutMs}ms — releasing it for the next queued operation; this operation's own result (if it still completes later) is discarded and the message is left as-is`);
+      expired = true;
+      console.error(`[lv_illust] message lock for "${key}" timed out after ${lockTimeoutMs}ms — releasing it for the next queued operation; this operation now aborts on its next write-point if it's still running, but can't be cancelled mid-flight`);
       resolve(undefined);
     }, lockTimeoutMs);
     if (typeof timer.unref === 'function') timer.unref(); // never keep the process alive just for this
   });
-  return Promise.race([Promise.resolve().then(fn), deadline]).finally(() => clearTimeout(timer));
+  return Promise.race([Promise.resolve().then(() => fn(isExpired)), deadline]).finally(() => clearTimeout(timer));
 }
 
 function withMessageLock(key, fn, lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS) {
@@ -299,11 +339,15 @@ export function _debugLockMapSize() {
  * in that window would be overwritten by the commit that follows). Orphan bookkeeping
  * is best-effort and now strictly follows the message commit, never precedes it.
  */
-async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs }) {
-  return withMessageLock(`${chatId}::${messageId}`, () => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }), lockTimeoutMs);
+async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs }) {
+  return withMessageLock(
+    `${chatId}::${messageId}`,
+    (isExpired) => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired }),
+    lockTimeoutMs,
+  );
 }
 
-async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }) {
+async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator, generateTimeoutMs, isExpired = () => false }) {
   const planList = await api.chat.getMessages(chatId);
   const message = planList.find((m) => m.id === messageId);
   if (!message || message.role !== 'assistant') return { changed: false };
@@ -328,7 +372,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   for (const job of jobs) {
     tagIndexToId.set(job.tagIndex, job.id);
     try {
-      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset });
+      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset, generateTimeoutMs });
       markers.set(job.tagIndex, { mode: 'replace', text: renderSuccessMarker(job.id, result.imageUrl, job.summary) });
       resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
@@ -346,6 +390,9 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 
   // --- everything above only decided *what* to do; everything below re-checks the
   // live message right before writing anything, and commits before any further RPCs. ---
+  // Review (4th pass) finding 1: an expired (past its lock deadline) operation must
+  // never write — checked immediately before every write point below, not just once.
+  if (isExpired()) return { changed: false, expired: true };
   const freshList = await api.chat.getMessages(chatId);
   const fresh = freshList.find((m) => m.id === messageId);
   const swipeChanged = !fresh || (fresh.swipe_id ?? 0) !== (message.swipe_id ?? 0);
@@ -354,7 +401,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
       id, messageId, ts: Date.now(),
       reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...r,
     }));
-    if (orphans.length) await pushOrphans(api, chatId, orphans);
+    if (orphans.length && !isExpired()) await pushOrphans(api, chatId, orphans);
     return { changed: false, orphaned: orphans.length };
   }
 
@@ -379,7 +426,15 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
       return;
     }
     if (entry.mode === 'insert') {
-      const insertAt = at + tag.raw.length;
+      // Review (4th pass) finding 2: malformed tags' `tag.raw` is now just a short,
+      // fixed-length RELOCATION anchor (see core.mjs buildMalformedTag) — the actual
+      // insertion point is always exactly 4 characters into wherever that anchor is
+      // found (right after the literal "<pic" opener), never "after the whole anchor".
+      // This was the one place still using the old `at + tag.raw.length` arithmetic,
+      // which silently reintroduced the bug this fix exists to prevent (reproduced:
+      // repeated writes at the backend/integration level even though core.mjs's own
+      // parseTags/applyMarkers were already fully idempotent).
+      const insertAt = at + 4;
       content = content.slice(0, insertAt) + entry.text + content.slice(insertAt);
       cursor = insertAt + entry.text.length;
       placedMalformedCount++;
@@ -397,10 +452,14 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   if (noContentChange && noNewImages && noNewMalformed) {
     // nothing could be placed at all (everything orphaned/already-annotated) — don't
     // write an otherwise-identical copy of content/metadata back over what's there now.
-    if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
+    if (orphanedNow.length && !isExpired()) await pushOrphans(api, chatId, orphanedNow);
     return { changed: false, orphaned: orphanedNow.length };
   }
 
+  // Last check immediately before the actual commit — this is the exact write the
+  // reviewer's reproduction exploited (everything up to here can take arbitrarily long
+  // via the generate loop's awaits, so the deadline may have already fired).
+  if (isExpired()) return { changed: false, expired: true };
   const currentImages = fresh.metadata?.[IDENTIFIER]?.images || {};
   await api.chat.updateMessage(chatId, messageId, {
     content,
@@ -408,21 +467,21 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   });
   // Orphan bookkeeping strictly AFTER the message commit (review finding 2) — never
   // between the revalidating read and the write.
-  if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
+  if (orphanedNow.length && !isExpired()) await pushOrphans(api, chatId, orphanedNow);
   return { changed: true, content, orphaned: orphanedNow.length };
 }
 
 // `idGenerator` is a test-only hook (never passed in production — see start() below):
 // core.mjs's nextImageId is collision-resistant (time+random) by default; tests inject
 // a deterministic counter so assertions on exact ids stay readable and stable.
-export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
+export function createService(api, { idGenerator, lockTimeoutMs, generateTimeoutMs } = {}) {
   async function handleGenerationEnded(payload) {
     if (!payload?.chatId || !payload?.messageId) return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, payload.chatId, true))) return;
     const characterId = await characterIdForChat(api, payload.chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs });
+    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs });
   }
 
   async function handleMessageEdited(payload) {
@@ -438,7 +497,7 @@ export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
     if (!(await isAutoOn(api, chatId, true))) return;
     const characterId = await characterIdForChat(api, chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs });
+    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs, generateTimeoutMs });
   }
 
   function registerInterceptor() {
@@ -499,7 +558,11 @@ export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
         return { auto: await isAutoOn(api, payload.chatId, true) };
       case 'regenerate': {
         if (!payload?.chatId || !payload?.messageId || !payload?.imageId) throw new Error('잘못된 요청');
-        return withMessageLock(`${payload.chatId}::${payload.messageId}`, () => regenerateLocked(api, payload), lockTimeoutMs);
+        return withMessageLock(
+          `${payload.chatId}::${payload.messageId}`,
+          (isExpired) => regenerateLocked(api, payload, isExpired, generateTimeoutMs),
+          lockTimeoutMs,
+        );
       }
       default:
         throw new Error('알 수 없는 요청');
@@ -512,7 +575,7 @@ export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
 // Serialized under the same per-message lock as processMessage — a panel regenerate
 // and a fresh generation for the same message can no longer interleave their
 // plan/commit either.
-async function regenerateLocked(api, payload) {
+async function regenerateLocked(api, payload, isExpired = () => false, generateTimeoutMs) {
   const messages = await api.chat.getMessages(payload.chatId);
   const message = messages.find((m) => m.id === payload.messageId);
   if (!message) throw new Error('메시지를 찾을 수 없습니다');
@@ -526,30 +589,40 @@ async function regenerateLocked(api, payload) {
     // unusable result), the existing marker/metadata for this image is left completely
     // untouched, so a working image is never replaced by a broken one.
     const mainPreset = await fetchMainPreset(api);
-    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset });
+    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset, generateTimeoutMs });
   } catch (err) {
     throw new Error('다시 그리기 실패: ' + String(err?.message || err));
   }
 
+  // Review (4th pass) finding 1: the generate() call above can take long enough for
+  // this operation's own lock deadline to elapse while it was awaiting — check before
+  // every write point below, not just once, same as processMessageInner.
+  if (isExpired()) return { ok: false, expired: true };
   const freshList = await api.chat.getMessages(payload.chatId);
   const fresh = freshList.find((m) => m.id === payload.messageId);
   const updated = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
   if (!fresh || (fresh.swipe_id ?? 0) !== originalSwipeId) {
-    await pushOrphans(api, payload.chatId, [{
-      id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
-      reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...updated,
-    }]);
+    if (!isExpired()) {
+      await pushOrphans(api, payload.chatId, [{
+        id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+        reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...updated,
+      }]);
+    }
     throw new Error('다시 그리는 동안 메시지가 바뀌어 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
   }
   const marker = renderSuccessMarker(payload.imageId, result.imageUrl, rec.summary);
   const re = markerRegexForId(payload.imageId);
   if (!re.test(fresh.content)) {
-    await pushOrphans(api, payload.chatId, [{
-      id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
-      reason: '그림 자리(태그)가 수정되어 넣지 못함', ...updated,
-    }]);
+    if (!isExpired()) {
+      await pushOrphans(api, payload.chatId, [{
+        id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+        reason: '그림 자리(태그)가 수정되어 넣지 못함', ...updated,
+      }]);
+    }
     throw new Error('그림 자리를 찾지 못해 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
   }
+  // Last check immediately before the actual commit (same rationale as processMessageInner).
+  if (isExpired()) return { ok: false, expired: true };
   const newContent = fresh.content.replace(re, marker);
   const currentImages = { ...(fresh.metadata?.[IDENTIFIER]?.images || {}) };
   currentImages[payload.imageId] = updated;

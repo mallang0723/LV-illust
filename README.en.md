@@ -69,10 +69,15 @@ flow works as-is.)
   image is never spliced into the (now different) message — it's kept as a recoverable,
   un-auto-retried, status-only entry visible in the panel instead (no regenerate button).
 - Processing for one message is serialized, and a hung operation (past 3 minutes)
-  releases its lock so later operations aren't blocked forever — but the hung operation
-  itself can't be cancelled (no cancellation primitive exists for this). If it finishes
-  very late, it could still write, out of step with whatever ran after it timed out —
-  a rare residual case, not fixed, logged when it happens.
+  releases its lock so later operations aren't blocked forever. A hung operation that
+  resumes later always checks, immediately before any write, whether it has already
+  expired — and skips the write if so, so it can no longer overwrite whatever a later
+  operation already committed (an earlier version of this check had a gap that let
+  exactly this happen; found and fixed by review). It still can't be truly cancelled
+  mid-flight while awaiting a single host call (no cancellation primitive exists for
+  that) — it just checks again the instant that call returns. The image-generation
+  queue has the same kind of deadline (5 minutes) so one stuck generation can't block
+  generation for other messages either.
 
 See `docs/API-NOTES.md` for the evidence behind every API claim (file:line,
 VERIFIED/INFERRED/UNVERIFIED).

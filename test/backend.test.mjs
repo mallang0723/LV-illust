@@ -661,7 +661,8 @@ test('REGRESSION (2nd pass, finding 1 — malformed never shrinks, integration l
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
   assert.ok(patch.content.length >= content.length);
   assert.ok(patch.content.includes('뒤이은 서사가 아주 길게 이어진다.'));
-  assert.ok(patch.content.includes('<pic prompt=bad>'));
+  // marker is spliced in right after the literal "<pic" opener (4th-pass structural fix)
+  assert.equal(patch.content.replace(MALFORMED_MARKER_TEXT, ''), content);
 });
 
 test('REGRESSION (2nd pass, finding 1): a malformed tag already marked is never re-flagged on a later MESSAGE_EDITED pass', async () => {
@@ -695,6 +696,22 @@ test('REGRESSION (3rd pass, finding 1 — exact scale from review): 60 distinct 
   assert.equal(totalWrites, 1, 'no further writes after the first pass, across 5 more passes');
   assert.equal(msg.content, stableContent);
   // and every original tag is still there, byte for byte, once our markers are peeled off
+  assert.equal(msg.content.split(MALFORMED_MARKER_TEXT).join(''), content);
+});
+
+test('REGRESSION (4th pass, finding 2 — exact short repro at the backend/integration level): ' +
+  '<pic prompt="unfinished with nothing after it settles after ONE write across 20 passes ' +
+  '(this exact shape previously caused 10 writes and a nested annotation)', async () => {
+  const content = '<pic prompt="unfinished';
+  const msg = assistantMsg('m1', content);
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const svc = createService(f.api);
+  for (let i = 0; i < 20; i++) {
+    // eslint-disable-next-line no-await-in-loop
+    await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  }
+  const writes = f.calls.filter((c) => c[0] === 'updateMessage').length;
+  assert.equal(writes, 1, 'exactly one write across 20 passes — was 10 before the structural fix');
   assert.equal(msg.content.split(MALFORMED_MARKER_TEXT).join(''), content);
 });
 
@@ -760,4 +777,102 @@ test('REGRESSION (3rd pass, finding 3): a hung predecessor cannot block a messag
   assert.equal(f.calls.find((c) => c[0] === 'updateMessage'), undefined);
   releaseHung(); // let the first call finish in the background so the test process can exit cleanly
   await hungCall.catch(() => {});
+});
+
+test('REGRESSION (4th pass, finding 1): an operation past its deadline must NOT write once it resumes — ' +
+  'it must not overwrite a second operation\'s image, edits, or metadata', async () => {
+  // Exact scenario from the review: pause operation A right at its final (pre-commit)
+  // re-read until its lock deadline elapses. Let operation B acquire the released lock
+  // and commit normally. Resume A. The previous (regressed) fix raced A's promise
+  // against the deadline but never stopped A from actually continuing to run in the
+  // background — A still reached its own `chat.updateMessage` call later and clobbered
+  // everything B had just written. The fix: A must check `isExpired()` immediately
+  // before that final write and bail out instead.
+  const msg = assistantMsg('m1', '<pic prompt="forest">');
+  let reads = 0;
+  let releaseA;
+  const gateA = new Promise((resolve) => { releaseA = resolve; });
+  let pausedNotify;
+  const pausedAtRead2 = new Promise((resolve) => { pausedNotify = resolve; });
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const realGetMessages = f.api.chat.getMessages;
+  f.api.chat.getMessages = async (chatId) => {
+    reads++;
+    const snapshot = await realGetMessages(chatId);
+    if (reads === 2) { pausedNotify(); await gateA; } // pause A right before its final re-read resolves
+    return snapshot;
+  };
+  const svc = createService(f.api, { idGenerator: counterIdGen(), lockTimeoutMs: 30 });
+
+  const opA = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' }); // never awaited yet — this is "A"
+  await pausedAtRead2; // A is now paused at its final read, holding the lock
+  await new Promise((r) => setTimeout(r, 60)); // let A's lock deadline elapse (30ms < 60ms)
+  await opA.catch(() => {}); // the lock's own race settles now (A itself is still paused/running)
+
+  // Operation B now runs for the SAME message and must be able to commit.
+  const opB = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  await opB;
+  const writesBeforeAResumes = f.calls.filter((c) => c[0] === 'updateMessage').length;
+  assert.equal(writesBeforeAResumes, 1, 'B must have committed exactly once');
+  const contentAfterB = msg.content;
+  const metadataAfterB = msg.metadata;
+  assert.ok(contentAfterB.includes('![그림:'), 'B\'s image must be in the message');
+
+  // Simulate an intervening user edit + another extension's metadata write, exactly
+  // like the reviewer's repro, to prove A doesn't revert EITHER when it resumes.
+  msg.content += ' USER EDIT';
+  msg.metadata = { ...(msg.metadata || {}), other_extension: { keep: true } };
+  const contentBeforeAResumes = msg.content;
+  const metadataBeforeAResumes = msg.metadata;
+
+  releaseA(); // let A's paused read finally return
+  await new Promise((r) => setTimeout(r, 20)); // give A a chance to (wrongly) write if the bug is back
+
+  const totalWrites = f.calls.filter((c) => c[0] === 'updateMessage').length;
+  assert.equal(totalWrites, 1, 'A must NOT have written anything after resuming past its deadline');
+  assert.equal(msg.content, contentBeforeAResumes, 'the user edit must survive — A must not revert it');
+  assert.deepEqual(msg.metadata, metadataBeforeAResumes, 'the other extension\'s metadata must survive');
+  void metadataAfterB; // (captured for clarity/debugging; not re-asserted separately)
+});
+
+test('REGRESSION (4th pass, finding 1): the global generation queue also has a deadline — a hung generate() call cannot block the queue forever, and its late result is discarded', async () => {
+  const msgA = assistantMsg('mA', '<pic prompt="first">');
+  const msgB = assistantMsg('mB', '<pic prompt="second">');
+  let releaseHungGenerate;
+  const hungGenerateGate = new Promise((resolve) => { releaseHungGenerate = resolve; });
+  let callCount = 0;
+  const lateResolutions = [];
+  const f = fakeApi({
+    messages: { cA: [msgA], cB: [msgB] }, chats: { cA: { id: 'cA' }, cB: { id: 'cB' } },
+    generateImpl: async (input) => {
+      callCount++;
+      if (callCount === 1) {
+        await hungGenerateGate; // the FIRST queued generate() hangs indefinitely
+        lateResolutions.push(input.prompt); // records if/when it eventually resolves
+      }
+      return { imageId: 'img-' + callCount, imageUrl: 'https://img/' + callCount + '.png' };
+    },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen(), generateTimeoutMs: 20 }); // tiny deadline for the test
+
+  const opA = svc.handleGenerationEnded({ chatId: 'cA', messageId: 'mA' }); // starts the hung generate()
+  await new Promise((r) => setTimeout(r, 5)); // let A's generate() actually start and occupy the queue
+  const opB = svc.handleGenerationEnded({ chatId: 'cB', messageId: 'mB' }); // queued behind A's generate()
+
+  await opB; // B must not wait for A's hung generate() past the 20ms deadline
+  assert.ok(msgB.content.includes('![그림:'), 'B\'s own generation must have proceeded once the queue moved on');
+
+  await opA; // A's own generate() call timed out too -> treated as an ordinary failure
+  assert.ok(msgA.content.includes('⚠️ 그림 생성 실패'), 'A must be recorded as a failure, not left hanging');
+  assert.equal(lateResolutions.length, 0, 'the hung generate() has not resolved yet');
+
+  // Now let the hung generate() actually resolve, long after both A and B were handled.
+  releaseHungGenerate();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(lateResolutions.length, 1, 'the hung call does eventually resolve in the background');
+  // ...but its late result was never written anywhere: A's own message still shows the
+  // failure marker (not a second, late success), and B's message is untouched by it.
+  assert.ok(msgA.content.includes('⚠️ 그림 생성 실패'));
+  assert.ok(!msgA.content.includes('img-1'));
+  assert.ok(!msgB.content.includes('img-1'));
 });

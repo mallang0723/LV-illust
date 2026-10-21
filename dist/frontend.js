@@ -46,29 +46,48 @@ function scanTag(text, openIdx) {
   }
 }
 
-// Review (3rd pass) finding 1: idempotency for malformed tags must come from the
-// CONTENT itself, not a side list (a capped metadata list evicts old entries while the
-// physical annotation stays in the message forever, causing endless re-annotation once
-// the distinct-malformed-tag count exceeds the cap — reproduced at 51 distinct tags /
-// 110 passes). Content-based check: if our fixed marker text is found immediately
-// after a malformed span, that occurrence has already been annotated — skip it
-// entirely (no new marker, `end` advances past the existing marker so it's never
-// re-included in a later span). No list, no cap, correct regardless of how many
-// malformed tags exist or how many passes run.
-function checkAnnotated(text, end) {
-  if (text.startsWith(MALFORMED_MARKER_TEXT, end)) {
-    return { annotated: true, end: end + MALFORMED_MARKER_TEXT.length };
-  }
-  return { annotated: false, end };
+// Review (4th pass) finding 2: the previous (3rd pass) fix computed a "malformed span"
+// heuristically (nearest '>', else nearest '<', else a 300-char bound) and checked for
+// our marker text immediately *after* that computed span. That still broke for
+// `<pic prompt="unfinished` + nothing closing: `scanTag`'s own unterminated-value scan
+// only stops at `"` or `<` — neither appears in our marker text — so on the SECOND
+// parse, the "unterminated value" scan read straight through the previously-inserted
+// marker as if it were more of the (still-unterminated) attribute value, which moved
+// where the span was computed to "end" on every pass, so the annotated-marker check
+// (looking right at that ever-shifting position) never found the marker that was
+// actually sitting further back — reproduced: 10 writes, a second marker nested inside
+// the first. Fixed structurally instead of heuristically: the marker is now inserted
+// immediately after the literal 4-character `<pic` opener itself (before ANY of the
+// tag's own attribute text), and it starts with a character — `⟦`, see
+// MALFORMED_MARKER_TEXT below — that is neither whitespace nor `>`. That means the very
+// first check below (`boundary = text[idx+4]`) rejects this `<pic` occurrence as "not a
+// tag opener" on every later parse, for the exact same reason `<pic-failed` already
+// was rejected — `scanTag` (and therefore the unterminated-value-scanning that caused
+// the bug) is never even invoked on it again. No span, no bound, no heuristic: a
+// malformed tag returned by this function is *always* one that has not been annotated
+// yet, because an annotated one can no longer be recognized as a `<pic` tag at all.
+//
+// The anchor text used for *relocation* (finding a malformed tag again in possibly-
+// changed content before splicing — see backend.mjs) is now just a short, fixed-length
+// prefix starting at the tag; it carries no significance beyond "a reasonably unique
+// search key" and is never used to decide where content ends or where the marker goes
+// (that's always exactly 4 characters into wherever the anchor is found).
+const MALFORMED_ANCHOR_LEN = 32;
+
+function buildMalformedTag(text, idx) {
+  const raw = text.slice(idx, Math.min(idx + MALFORMED_ANCHOR_LEN, text.length));
+  return { start: idx, end: idx + 4, raw, malformed: true, charsRaw: '', promptRaw: '' };
 }
 
 /**
  * Find every `<pic ...>` occurrence in `content` (well-formed tags, parsed; malformed
  * ones flagged) in document order, non-overlapping. Already-rendered markers
- * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`, and an already-annotated
- * malformed tag's marker) never start a new match of their own (nothing there starts
- * with `<pic` followed by whitespace/`>`), so re-running this on an already-processed
- * message is a no-op — satisfies "never re-process already-rendered images".
+ * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`) and already-annotated
+ * malformed tags never start a new match of their own — nothing there starts with
+ * `<pic` followed by whitespace/`>` — so re-running this on an already-processed
+ * message is a no-op — satisfies "never re-process already-rendered images", and a
+ * malformed tag this function returns is *always* new (never already annotated; see
+ * above).
  */
 export function parseTags(content) {
   const text = String(content ?? '');
@@ -79,7 +98,8 @@ export function parseTags(content) {
     if (idx === -1) break;
     const boundary = text[idx + 4];
     if (boundary !== undefined && boundary !== '>' && !WS.test(boundary)) {
-      // e.g. "<pic-failed" — not our tag at all, keep scanning
+      // e.g. "<pic-failed", or an already-annotated malformed tag (our marker's first
+      // character is deliberately neither whitespace nor '>') — not our tag, skip it.
       searchFrom = idx + 4;
       continue;
     }
@@ -88,44 +108,22 @@ export function parseTags(content) {
       const { attrs } = scanned;
       const hasChars = Object.prototype.hasOwnProperty.call(attrs, 'chars');
       const hasPrompt = Object.prototype.hasOwnProperty.call(attrs, 'prompt');
-      const malformed = !hasChars && !hasPrompt;
-      const raw = text.slice(idx, scanned.end);
-      const { annotated, end } = malformed ? checkAnnotated(text, scanned.end) : { annotated: false, end: scanned.end };
+      if (!hasChars && !hasPrompt) {
+        const tag = buildMalformedTag(text, idx);
+        out.push(tag);
+        searchFrom = tag.end;
+        continue;
+      }
       out.push({
-        start: idx, end, raw, malformed, annotated,
-        charsRaw: hasChars ? attrs.chars : '',
-        promptRaw: hasPrompt ? attrs.prompt : '',
+        start: idx, end: scanned.end, raw: text.slice(idx, scanned.end), malformed: false,
+        charsRaw: hasChars ? attrs.chars : '', promptRaw: hasPrompt ? attrs.prompt : '',
       });
-      searchFrom = end;
+      searchFrom = scanned.end;
     } else {
       // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
-      //
-      // This span is now ONLY used to (a) decide where to insert an annotation / detect
-      // an existing one and (b) decide where to resume scanning for more `<pic`
-      // occurrences — it is NEVER used to delete/replace anything (see
-      // planMessage/renderMalformedMarker: malformed handling only ever INSERTS a short
-      // marker after the untouched original text, never replaces it). Still bounded to
-      // a small span regardless of which branch is taken — review (2nd pass) finding 1
-      // caught that the `nextLt` fallback below had NO bound at all, so a broken tag
-      // followed by a long stretch of real narrative and then any later '<' (even a
-      // genuine later tag far down the message) made `tag.raw` swallow all of that
-      // narrative. Capping every branch at BOUND avoids that regardless of what used to
-      // (and no longer does) happen to the swallowed text.
-      const BOUND = 300;
-      const nextLt = text.indexOf('<', idx + 4);
-      const nextGt = text.indexOf('>', idx + 4);
-      let rawEnd;
-      if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
-        rawEnd = nextGt + 1; // include the stray '>' — the broken tag's apparent close
-      } else if (nextLt !== -1 && nextLt - idx <= BOUND) {
-        rawEnd = nextLt; // stop before whatever starts next (often a later real tag)
-      } else {
-        rawEnd = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
-      }
-      const raw = text.slice(idx, rawEnd);
-      const { annotated, end } = checkAnnotated(text, rawEnd);
-      out.push({ start: idx, end, raw, malformed: true, annotated, charsRaw: '', promptRaw: '' });
-      searchFrom = end;
+      const tag = buildMalformedTag(text, idx);
+      out.push(tag);
+      searchFrom = tag.end;
     }
   }
   return out;
@@ -374,11 +372,21 @@ export function renderSkippedMarker(id, tag) {
 // the previous version REPLACED the malformed span with a marker that re-summarized
 // (and therefore truncated/destroyed) the original text. The fixed design never
 // replaces anything for a malformed tag: this fixed, short marker is only ever
-// INSERTED immediately *after* the untouched original text (see planMessage's
-// `{mode:'insert', ...}` entries and backend.mjs's splice loop), so message length can
-// only grow, never shrink, because of malformed-tag handling. No `tag` data is embedded
+// INSERTED immediately *after* the literal `<pic` opener (see planMessage's
+// `{mode:'insert', ...}` entries and backend.mjs's splice loop — always exactly 4
+// characters into wherever the tag's anchor is found), so message length can only
+// grow, never shrink, because of malformed-tag handling. No `tag` data is embedded
 // (nothing to escape, nothing to summarize — the real text is right there, intact).
-export const MALFORMED_MARKER_TEXT = ' [⚠️ 그림 태그 형식 오류 — 고치면 다시 시도됩니다]';
+//
+// Review (4th pass) finding 2: this text must start with a character that is neither
+// whitespace nor '>' — `parseTags`'s boundary check (`boundary = text[idx+4]`) relies
+// on that to recognize an annotated tag as "not a `<pic` opener" on every later parse,
+// without needing to locate or compare against this marker at all (see buildMalformedTag
+// above). A leading space here would defeat that: whitespace right after `<pic` still
+// passes the boundary check as "maybe our tag", so `scanTag` would run again and the
+// bug this marker exists to prevent would resurface. `⟦`/`⟧` (not `<`/`>`) are used so
+// the marker itself can never be mistaken for tag syntax either.
+export const MALFORMED_MARKER_TEXT = '⟦삽화가: 그림 태그 형식 오류 — 고치면 다시 시도됩니다⟧';
 export function renderMalformedMarker() {
   return MALFORMED_MARKER_TEXT;
 }
@@ -409,11 +417,12 @@ export function planMessage(content, { registry = [], maxImages = 2, existingIma
   let validCount = 0;
   tags.forEach((tag, i) => {
     if (tag.malformed) {
-      // Review (3rd pass) finding 1: idempotency is now a property of `tag.annotated`
-      // (content-based, computed by parseTags itself — see checkAnnotated) rather than
-      // a side list here, so there is nothing to cap and nothing that can drift out of
-      // sync with what's actually in the message.
-      if (!tag.annotated) markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
+      // Review (4th pass) finding 2: parseTags structurally never returns an
+      // already-annotated malformed tag (see buildMalformedTag) — an annotated
+      // occurrence can no longer even be recognized as a `<pic` tag, so it's filtered
+      // out before parseTags ever reaches the point of flagging it malformed. Every
+      // malformed tag reaching here is therefore guaranteed to need a new marker.
+      markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
       return;
     }
     validCount++;

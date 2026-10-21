@@ -306,15 +306,26 @@ caveat as the LoRA/style preset finding above).
   user has no active preset of either kind configured, composition is a no-op either
   way (falls back to the scene prompt alone, by design); if they do have one, it should
   apply, but this needs one real generation to see confirmed.
-- **Accepted residual risk: the per-message lock's timeout cannot cancel a hung
-  operation, only stop waiting for it.** If an operation (e.g. a stuck `generateNative`
-  RPC with no timeout of its own) hangs past `lockTimeoutMs` (default 3 minutes), the
-  lock releases so later operations for the same message aren't blocked forever — but
-  the hung operation keeps running in the background with no cancellation signal wired
-  through arbitrary host RPCs. If it eventually completes and was far enough along to
-  reach its own `chat.updateMessage` call, that write could still land, uncoordinated
-  with whatever ran after the timeout. Not fixed — no cancellation primitive exists to
-  fix it with; logged via `console.error` when it happens so it's at least observable.
+- **Accepted residual risk (narrowed in the 4th review round): the per-message lock's
+  timeout cannot truly cancel a hung operation, only stop waiting for it AND stop it
+  from writing once it checks.** If an operation (e.g. a stuck `generateNative` RPC with
+  no timeout of its own) hangs past `lockTimeoutMs` (default 3 minutes), the lock
+  releases so later operations for the same message aren't blocked forever, and the
+  expired operation itself now checks `isExpired()` immediately before every write
+  (`chat.updateMessage`, `pushOrphans`) and bails out if it's already past its deadline
+  — this is what closed the round-4 data-loss regression (an expired operation
+  previously still reached its write unconditionally). What remains unfixed, because no
+  cancellation primitive is plumbed through arbitrary host RPCs: if the operation is
+  suspended *inside* an `await` on a host call (e.g. mid-`generateNative`) at the exact
+  moment its deadline fires, it keeps running until that `await` resolves — it simply
+  checks `isExpired()` immediately afterward instead of proceeding blindly. So the
+  window for "it writes something uncoordinated" is now bounded to "it was already past
+  the LAST write-point check when the deadline fired" (a race that would require the
+  deadline to fire in the narrow gap between a check and the write it guards — possible
+  in principle, since JS can't make a check-then-write atomic across a true `await`
+  boundary without a lock the write itself participates in, but not observed in testing
+  and far narrower than the round-4 regression, which clobbered unconditionally).
+  Logged via `console.error` when a deadline fires so it's at least observable.
 
 ## Independent review (Codex) findings — verified against this code, then fixed
 
@@ -544,6 +555,89 @@ MINOR found; all 3 confirmed real against the actual code, none rejected.
 
 No findings were rejected in this pass either — all 3 confirmed real, fixed,
 regression-tested. 124 tests total (was 103), all passing.
+
+## Fourth independent review (Codex, with host sources available) — NOT CLEAR, then fixed
+
+A fifth review pass re-tested round 3's fixes with real reproductions and found that
+**both** were incomplete: the lock-deadline fix for finding 1 (round 3) introduced a new
+data-loss regression of its own, and the malformed-tag structural fix for finding 2
+(round 3) still had a surviving failure mode for the exact short repro. **Verdict was
+"NOT CLEAR."** Both findings were reproduced, root-caused, and fixed; none rejected.
+
+1. **MAJOR regression (round-3 fix for the lock deadline was itself unsafe) — an
+   expired operation could still write and clobber a later operation's result.**
+   Confirmed and reproduced exactly: round 3's `raceWithDeadline` raced an operation's
+   promise against a timer so the NEXT queued operation wouldn't wait forever — but
+   racing a promise never cancels the loser. The reviewer paused an operation (A) right
+   before its final re-read, let A's deadline elapse (so a second operation, B, could
+   acquire the lock and commit normally), then resumed A — and A's own, now-stale
+   `chat.updateMessage` call still fired, overwriting B's image, an intervening user
+   edit, and unrelated metadata, all in one write. **Fixed:** every locked operation now
+   receives an `isExpired()` function; `processMessageInner` and `regenerateLocked`
+   check it immediately before **every** write point (both `pushOrphans` call sites and
+   the main `chat.updateMessage` commit, not just once) and bail out without writing if
+   it's already true. This doesn't achieve true cancellation of a hung RPC the
+   operation might be awaiting at the exact moment it expires (no cancellation
+   primitive exists for that) — but it closes the actual data-loss hole, because by the
+   time an expired operation reaches any write, it now always discovers it's expired
+   first and stops. Also applied the identical pattern to the *separate* global
+   generation queue (`queuedCall`/`raceGenerateDeadline`, `generateTimeoutMs`, default 5
+   minutes): a hung `generateNative()` call no longer blocks every later queued
+   generation (for any message) — the race rejects on timeout, which the existing
+   try/catch in `processMessageInner`/`regenerateLocked` already treats as an ordinary
+   generation failure (never writes without re-validating), so a late real result from
+   the hung call, if it ever arrives, is simply discarded — nothing is left waiting for
+   it. Tests: an exact reproduction of the reviewer's scenario (pause A at its final
+   read, let its deadline elapse, run B to completion, resume A, assert A does not
+   write and B's image/edit/metadata all survive) and a separate test for the global
+   queue (a hung first generate() does not block a second message's generation, and the
+   hung call's late resolution never reaches either message).
+2. **MAJOR (round-3 fix for malformed-tag idempotency was incomplete) — the exact short
+   repro `<pic prompt="unfinished` (nothing after it: no closing quote, no `>`, no `<`,
+   no trailing prose) still produced 10 writes and a corrupted/nested annotation.**
+   Root-caused: round 3 made idempotency content-based (check for the marker
+   immediately *after* a computed malformed span) but still computed that span
+   heuristically, and `scanTag`'s own unterminated-attribute-value scanning only stops
+   at `"` or `<` — neither of which appears in the marker text — so on the second pass,
+   the "unterminated value" scan read straight through the first-inserted marker as if
+   it were more of the (still-unterminated) value, which moved where the span was
+   computed to end on every subsequent pass, so the "is the marker right after the
+   span" check kept looking in the wrong (ever-shifting) place and never found the
+   marker it had already inserted. **Fixed structurally this time, exactly as
+   requested:** the marker is now inserted immediately after the literal 4-character
+   `<pic` opener itself — before any of the tag's own attribute text — and
+   `MALFORMED_MARKER_TEXT` was changed to start with `⟦` (a character that is neither
+   whitespace nor `>`). `parseTags`'s very first check on each `<pic` occurrence
+   (`boundary = text[idx+4]`) already rejects anything where that position isn't
+   whitespace or `>` as "not a tag opener" (this is the exact same rule that already
+   made `<pic-failed`/`<pic-skipped` sentinels unparseable) — so an annotated malformed
+   tag can no longer even be *recognized* as a `<pic` tag on a later pass, and
+   `scanTag`'s problematic unterminated-value scanning is never invoked on it again at
+   all. This eliminates the need for any span-length heuristic for malformed tags:
+   `buildMalformedTag` no longer looks for `>`/`<` boundaries or applies any bound to
+   decide where the tag "ends" — the relocation anchor used to re-find a malformed tag
+   in possibly-changed content (see backend.mjs) is now just a fixed 32-character
+   prefix, with no significance beyond being a reasonably unique search key (insertion
+   is always exactly 4 characters into wherever that anchor is found, regardless of the
+   anchor's own length). **A bug was also found and fixed in `backend.mjs`’s own splice
+   loop while implementing this**: it still computed the insertion point as
+   `at + tag.raw.length` (the OLD "insert after the whole anchor" arithmetic) instead of
+   `at + 4` — core.mjs's own `parseTags`/`applyMarkers` were already fully correct and
+   idempotent by this point, but backend.mjs's separate, hand-written splice loop (kept
+   separate from `applyMarkers` for the stale-write-race fix, see finding 1 above) still
+   had the stale arithmetic, which silently reintroduced repeated writes at the
+   integration level even though core-level tests already passed. Caught by the
+   project's own backend-level regression test for this exact scenario, not by the
+   external review. Tests: the N=20-pass property tests from round 3 (60 distinct tags;
+   unterminated + long prose; mixed valid/malformed) plus a new one for the *exact*
+   short repro; a 40-trial seeded fuzz test (`FUZZ (review, 3rd pass, finding 1)`)
+   generating random mixes of valid tags, unterminated tags at message end, unterminated
+   tags followed by prose containing `<`/`>`/`"`, and nested `<pic` openers, each run for
+   20 passes and asserted idempotent + byte-recoverable; and a backend-level test
+   reproducing the exact short repro through the real event handlers.
+
+Both findings confirmed real against the actual code and reproduced before fixing;
+none rejected. 129 tests total (was 124), all passing.
 
 ## What was explicitly NOT done (by design, not oversight)
 

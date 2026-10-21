@@ -302,12 +302,13 @@ test('applyMarkers: replacing both tags produces exact splice with no drift', ()
   assert.equal(out, 'A [X] B [Y] C');
 });
 
-test('applyMarkers: "insert" keeps the original tag text intact and only appends after it', () => {
+test('applyMarkers: "insert" (malformed tags) splices the marker right after the literal "<pic" opener, keeping all original text intact', () => {
   const content = 'A <pic foo="bad"> B';
   const tags = C.parseTags(content);
   const out = C.applyMarkers(content, tags, new Map([[0, { mode: 'insert', text: '[NOTE]' }]]));
-  assert.equal(out, 'A <pic foo="bad">[NOTE] B');
+  assert.equal(out, 'A <pic[NOTE] foo="bad"> B');
   assert.ok(out.length >= content.length); // never shrinks
+  assert.equal(out.replace('[NOTE]', ''), content); // removing the marker recovers the original exactly
 });
 
 test('full pipeline: plan -> generate (simulated) -> apply markers for a 3-tag message with one malformed', () => {
@@ -319,7 +320,9 @@ test('full pipeline: plan -> generate (simulated) -> apply markers for a 3-tag m
   assert.equal(jobs[1].tagIndex, 2);
   for (const job of jobs) markers.set(job.tagIndex, { mode: 'replace', text: C.renderSuccessMarker(job.id, 'https://img/' + job.id, job.summary) });
   const out = C.applyMarkers(content, tags, markers);
-  assert.ok(out.includes('<pic foo="bad">')); // malformed tag's original text survives verbatim
+  // malformed tag's original text survives verbatim — marker is spliced in right after
+  // the literal "<pic" opener, so the full original tag appears with the marker inside it
+  assert.ok(out.includes(`<pic${C.MALFORMED_MARKER_TEXT} foo="bad">`));
   assert.ok(out.includes('![그림:p1|1]'));
   assert.ok(out.includes('형식 오류'));
   assert.ok(out.includes('![그림:p2|2]'));
@@ -447,17 +450,19 @@ test('REGRESSION (review finding 2, round 1): a malformed tag never eats narrati
   // Original bug: no closing '>' was found for this broken tag AND no further '<'
   // existed anywhere in the message, so the old code took "the rest of the string" as
   // the malformed span and collapsed it to a 200-char marker summary, destroying the
-  // narrative. Fixed version finds the stray '>' right after "bad" and stops there.
+  // narrative. Fixed version (4th pass) inserts the marker structurally right after the
+  // literal "<pic" opener, so no span over the following text is ever computed at all.
   const narrative = '그 뒤로 아주 긴 이야기가 이어졌다. '.repeat(20); // > 200 chars of real prose
   const content = `Before <pic prompt=bad> ${narrative}`;
   const tags = C.parseTags(content);
   assert.equal(tags.length, 1);
   assert.equal(tags[0].malformed, true);
-  assert.equal(tags[0].raw, '<pic prompt=bad>'); // only the broken tag itself, not the prose after it
+  assert.equal(tags[0].end, tags[0].start + 4); // insertion point is always right after "<pic"
   const out = C.applyMarkers(content, tags, new Map([[0, { mode: 'insert', text: C.renderMalformedMarker() }]]));
   assert.ok(out.includes(narrative), 'narrative text must survive verbatim');
   assert.ok(out.startsWith('Before '));
   assert.ok(out.length >= content.length, 'malformed handling must never shrink the message');
+  assert.equal(out.replace(C.MALFORMED_MARKER_TEXT, ''), content); // byte-for-byte recoverable
 });
 
 test('REGRESSION (review finding 2, round 1): a truly unterminated tag with nothing nearby is still bounded, not unlimited', () => {
@@ -503,12 +508,16 @@ test('REGRESSION (review finding 1, round 2 — exact repro): an unterminated ta
 // ---------------------------------------------------------------- REGRESSION (review, 3rd pass): malformed-tag
 // idempotency must come from the CONTENT itself (no capped side list to evict and desync from reality).
 
-// Simulates exactly what backend.mjs's processMessageInner does to a message on one pass,
-// restricted to malformed-tag handling (no registry/generation involved): plan, then
-// splice only the 'insert' markers in (malformed tags never get a 'replace' entry).
+// Simulates malformed-tag handling in isolation (no registry/generation involved):
+// plan, then splice ONLY the 'insert' markers in. Deliberately filters out 'replace'
+// markers (success/failure/skip, for VALID tags) — those legitimately change content
+// (that's the whole point of F2/F5) and are tested elsewhere; mixing them in here would
+// make a "byte-for-byte recoverable by removing just the malformed marker" assertion
+// fail for an unrelated, correct reason (e.g. a 3rd valid tag getting skip-replaced).
 function processMalformedOnce(content) {
   const { tags, markers } = C.planMessage(content, { registry: [] });
-  return C.applyMarkers(content, tags, markers);
+  const insertOnly = new Map([...markers].filter(([, entry]) => entry.mode === 'insert'));
+  return C.applyMarkers(content, tags, insertOnly);
 }
 
 function runPasses(content, n) {
@@ -526,6 +535,11 @@ for (const [label, makeContent] of [
   ['60 distinct malformed tags', () => Array.from({ length: 60 }, (_, i) => `<pic foo="bar${i}">`).join(' 사이 글 ')],
   ['an unterminated tag + long prose', () => `<pic prompt="unfinished ${'긴 이야기가 이어진다. '.repeat(60)}`],
   ['a mix of valid and malformed tags', () => '<pic prompt="ok1"><pic foo="bad1"> 중간 글 <pic prompt="ok2"><pic foo="bad2">'],
+  // Codex's round-4 exact repro: nothing after the tag at all (no closing quote, no
+  // '>', no '<', no trailing prose) — the shortest possible case that previously caused
+  // 10 writes and a nested annotation (scanTag's unterminated-value scan read straight
+  // through the first-inserted marker, since it contains no '"' or '<' to stop at).
+  ['the exact short repro (<pic prompt="unfinished, nothing else)', () => '<pic prompt="unfinished'],
 ]) {
   test(`REGRESSION (review, 3rd pass, finding 1): N=20 passes over ${label} — only the first pass writes, the rest are a no-op, and all original text survives`, () => {
     const content = makeContent();
@@ -542,6 +556,48 @@ for (const [label, makeContent] of [
     assert.equal(recovered, content, 'original text must be byte-for-byte preserved');
   });
 }
+
+// Deterministic PRNG (no external deps) so a failure is reproducible from the printed seed.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function fuzzMessage(rng) {
+  const pieces = [
+    () => `<pic chars="아드리안" prompt="장면${Math.floor(rng() * 1000)}">`, // valid
+    () => `<pic prompt="unfinished${rng() < 0.5 ? '' : ' 꼬리'}`, // unterminated at end-of-piece
+    () => `<pic prompt="broken > with gt and < lt and \" quote`, // unterminated, embeds >, <, "
+    () => '<pic <pic nested opener looks like another tag', // nested "<pic"
+    () => '그냥 평범한 서사 문장입니다. '.repeat(1 + Math.floor(rng() * 3)), // plain prose
+    () => `<pic foo="bar${Math.floor(rng() * 1000)}">`, // well-formed but missing chars/prompt
+  ];
+  const n = 2 + Math.floor(rng() * 6);
+  let out = '';
+  for (let i = 0; i < n; i++) out += pieces[Math.floor(rng() * pieces.length)]() + ' ';
+  return out;
+}
+
+test('FUZZ (review, 3rd pass, finding 1): random mixes of valid/malformed/unterminated/nested tags, 20 passes each — idempotent and byte-recoverable', () => {
+  const SEED = 20261022;
+  const rng = mulberry32(SEED);
+  for (let trial = 0; trial < 40; trial++) {
+    const content = fuzzMessage(rng);
+    const { final, writes } = runPasses(content, 20);
+    for (let i = 1; i < writes.length; i++) {
+      assert.equal(writes[i], false,
+        `trial ${trial} (seed ${SEED}) pass ${i + 1} must be a no-op; content=${JSON.stringify(content)}`);
+    }
+    assert.equal(processMalformedOnce(final), final, `trial ${trial} (seed ${SEED}): final state must be a fixed point`);
+    assert.equal(final.split(C.MALFORMED_MARKER_TEXT).join(''), content,
+      `trial ${trial} (seed ${SEED}): original text must be byte-for-byte recoverable; content=${JSON.stringify(content)}`);
+  }
+});
 
 test('REGRESSION (review, 3rd pass, finding 1): a capped/evicting side list is no longer part of the API at all', () => {
   // planMessage no longer accepts or needs a `seenMalformed` option — idempotency is a
