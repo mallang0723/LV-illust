@@ -63,6 +63,42 @@ independently re-derived from the installer's permission-check code.
   *connection profile* configuration, which this extension never inspects — **not
   applicable to this extension's code**, carried over from DESIGN.md's own note.
 
+### `generate()` vs `generateNative()` — decision: switched to `generateNative()`
+
+Review (2nd pass) finding 5 pointed out that DESIGN.md §0 explicitly says this extension
+relies on **Lumiverse's own** main/style image prompt presets rather than storing its
+own, and that `imageGen.generate()` does not apply them. Investigated by reading
+(read-only, `docker exec lumiverse cat ...`, copies kept at `.review/host/`):
+`worker-host-image-gen-api.ts` (`handleGenerate` ~208-219, `handleGenerateNative`
+~223-335) and `/app/src/services/image-gen.service.ts` (`generateSceneBackground`
+~373-712, `resolveImagePrompt`/`parseCustomPrompt` ~1488-1540, `composeWithBaseTags`
+~1144-1150, `resolveActiveLoraPreset` ~176-180).
+
+**What each path actually does, verified by reading the implementation (not just the
+type signature):**
+
+| | `imageGen.generate()` | `imageGen.generateNative()` |
+|---|---|---|
+| Permission | `image_gen` only (`worker-host-image-gen-api.ts:107-110`, `requirePermission()` checks only `"image_gen"` — identical gate on both handlers) | same |
+| Parameter merge | `{...connection.default_parameters, ...input.parameters}` only (`handleGenerate` → `resolveGeneration` → provider call directly; no preset/LoRA logic anywhere in that path) | same merge happens first (`image-gen.service.ts:424-426`), **then** composed further (see below) |
+| Native style/LoRA preset | **never applied** — this is finding 5's bug | `resolveActiveLoraPreset(settings)` (`:482`) resolves the user's active native preset; its `base_tags` is **unconditionally** composed onto the prompt via `composeWithBaseTags(tags, promptResult.prompt)` (`:501-505`) — this is not gated by `promptMode`/`skipParse` at all, so it still applies even with scene-analysis skipped. Its LoRA layers are applied to `params` too (`:477-500`) |
+| Card-bound character LoRA | n/a | `resolveImageCharacterLayer(userId, chatId, opts?.characterLora)` resolves the chat's own bound character LoRA by default when `characterLora` is omitted (left `undefined`) — free extra correctness, not something we construct ourselves |
+| Our `parameters.characterTags` | passed straight to the provider via `connection.default_parameters` merge; provider maps it directly (verified in novelai.ts, above) | merged in the same way, **then** at `:526-534` a NovelAI-specific block would **overwrite** `params.characterTags` from `promptResult.scene.character_appearances` *if and only if* `promptResult.scene` exists (i.e. scene-analysis ran). With `promptMode: 'custom'` (what `skipParse: true` resolves to, `handleGenerateNative` ~267-270), `resolveImagePrompt`'s `mode === 'custom'` branch (`image-gen.service.ts:1498`) returns `{prompt, negativePrompt}` with **no `scene` key at all** — so `Array.isArray(undefined?.character_appearances)` is `false`, the overwrite condition never fires, and our own `characterTags` survive completely untouched. **VERIFIED by reading the exact branch**, not inferred. |
+| Scene-analysis LLM call | n/a (never calls it) | skipped entirely under `promptMode:'custom'` — we supply the exact scene prompt the tag's author already wrote; we do not want it re-interpreted by another LLM call |
+| Request shape used | `{prompt, parameters, owner_chat_id, includeDataUrl}` | `{chat_id, prompt, promptMode:'custom', skipParse:true, parameters:{characterTags}, includeDataUrl:false}` — note the field name difference, `chat_id` not `owner_chat_id` (`worker-host-image-gen-api.ts:230-231` reads `input?.chat_id`) |
+
+**Decision: switched `generateImage()` (backend.mjs) to `imageGen.generateNative()`**
+with `promptMode: 'custom', skipParse: true`. This gets the user's native style/LoRA
+preset composed onto our scene prompt (satisfying DESIGN.md §0's "use Lumiverse's own
+image prompt presets") while our own `characterTags` (built from the per-card registry,
+F3) pass through completely unmodified, and without invoking Lumiverse's own
+scene-analysis LLM call (we already have an exact scene prompt from the `<pic>` tag's
+author — re-interpreting it would be redundant and could drift from what was asked for).
+**Confidence: VERIFIED by direct source read** of the exact conditional branches above,
+not inferred from type signatures alone. **Not independently re-verified against a live
+generation** — the composed-prompt behavior (style preset text actually prepended) has
+not been visually confirmed on a real server; see "Known limitations".
+
 ## Chat mutation
 
 - `chat.updateMessage(chatId, messageId, patch)`: `patch.metadata`, if present,
@@ -177,6 +213,14 @@ independently re-derived from the installer's permission-check code.
   important thing to check in the "first task before building" sense that DESIGN.md §6
   asked for, and it could not be fully closed from source alone — it needs one real
   generation with a `<pic>` tag to see what actually renders.**
+- **UNVERIFIED: `generateNative`'s native style/LoRA preset composition, in practice.**
+  The *code path* that composes the user's active native preset's `base_tags` onto the
+  prompt is verified by direct source read (see the `generate()` vs `generateNative()`
+  section above, with file:line citations) — but whether that preset text actually shows
+  up, visibly, in a real generated image has not been confirmed on a live server. If the
+  user has no active native preset configured, this is a no-op either way (`base_tags`
+  composition is skipped when `activePreset` is null); if they do have one, it should
+  apply, but this needs one real generation to see confirmed.
 
 ## Independent review (Codex) findings — verified against this code, then fixed
 
@@ -244,6 +288,96 @@ Each was checked against the actual source (not taken on faith) before fixing:
 No findings were rejected — all 7 were real bugs against this codebase, each with its own
 regression test (`REGRESSION (review finding N)` in `test/core.test.mjs`, `REGRESSION …`
 in `test/backend.test.mjs` and `test/frontend.test.mjs`).
+
+## Second independent review (Codex, with host sources available) — verified, then fixed
+
+A third review pass, this time with read-only copies of the actual host implementation
+available (`.review/host/`, gitignored), re-tested the round-1 fixes directly (not just
+read the code) and found that two of them were incomplete, plus three new issues. All 7
+were checked against the actual code before fixing — **none were rejected**.
+
+1. **BLOCKER, confirmed real (round-1 fix was incomplete).** The round-1 fix to
+   `parseTags`'s malformed-tag boundary added a `>`-preferring heuristic, but the
+   fallback branch that stops at the next `<` had **no bound at all** — a broken tag
+   followed by ~2000 chars of real narrative and then *any* later `<` (not necessarily
+   another `<pic>` tag) still made the entire narrative part of "the malformed span",
+   which then got replaced by a marker (destroying it). Reviewer reproduced a 2,030→230
+   character loss. Root design flaw, not just the missing bound: **replacing** a
+   malformed tag's span with a marker is inherently destructive no matter how well the
+   span is bounded. Fixed properly this time: malformed tags are never replaced — the
+   original text is left **byte-for-byte in place**, and a short marker is only ever
+   *inserted* right after it (`core.mjs` `planMessage`'s `{mode:'insert', ...}` entries,
+   `backend.mjs`'s splice loop). A `metadata.lv_illust.malformedSeen` list (raw tag text)
+   prevents the same malformed tag from being re-annotated on every later pass, since the
+   text itself is never consumed/altered and would otherwise be "detected" again forever.
+   The boundary-detection bound was also fixed to actually apply to the `nextLt` fallback
+   too (it's now just dedup-key/scan-resume hygiene, not a safety mechanism, since nothing
+   is deleted any more). Tests: `test/core.test.mjs` "REGRESSION (review finding 2, round
+   1)" (updated) + "REGRESSION (review finding 1, round 2 — exact repro)" (reproduces the
+   reviewer's ~2000-char case directly), `test/backend.test.mjs` two new integration-level
+   tests.
+2. **BLOCKER, confirmed real.** The round-1 fix to the stale-write race re-fetched the
+   live message before committing — correct — but then **awaited `pushOrphans()`
+   between that revalidating read and the actual commit**. `pushOrphans` does its own
+   read-modify-write RPC pair (`variables.chat.get`/`set`), and an edit landing during
+   those RPCs would be silently overwritten by the commit that followed, reopening
+   exactly the race round 1 had just closed. Fixed: the message commit now always
+   happens first, with no RPC awaited in between the revalidating read and the write;
+   orphan bookkeeping strictly follows it. Test: `test/backend.test.mjs` "REGRESSION
+   (2nd pass, finding 2)".
+3. **MAJOR, confirmed real.** `GENERATION_ENDED` and `MESSAGE_EDITED` can fire close
+   together for the *same* message. Each handler planned independently from its own
+   snapshot (ids allocated from `existingImageIds` computed at that snapshot) — two
+   overlapping handlers could both allocate `"p1"`, and whichever committed second
+   silently overwrote the first's metadata record, even though the generation queue
+   serialized the actual NAI calls. Fixed two ways: (a) `backend.mjs` now serializes the
+   entire plan→generate→commit sequence per `(chatId, messageId)` via an in-memory lock
+   (`withMessageLock`), and planning always re-reads the live message *after* acquiring
+   the lock, so a handler queued behind another sees everything the first already
+   committed before it plans anything; (b) `core.mjs`'s `nextImageId` is now
+   collision-resistant by default (time+random), not a small sequential counter, as
+   defense in depth for what the in-process lock can't cover (a worker restart
+   mid-generation) — tests inject a deterministic counter via the new `idGenerator`
+   option so assertions on exact ids stay readable. Test: `test/backend.test.mjs`
+   "REGRESSION (2nd pass, finding 3)".
+4. **MAJOR, confirmed real.** The host can resolve `generate()`/`generateNative()`
+   successfully while image persistence failed internally
+   (`worker-host-image-gen-api.ts:180-206` catches that and still resolves); `imageId`/
+   `imageUrl` are optional on the result DTO (`api.d.ts:818-825`). The extension still
+   recorded `status:'ok'` and wrote `![그림:id|...](undefined)` — and on regenerate, this
+   could replace a previously-working image with a broken one. Fixed: `generateImage()`
+   now validates the result has a non-empty `imageUrl` string and throws (routed through
+   the existing failure path) otherwise; `regenerate` validates *before* touching any
+   content/metadata, so a bad regeneration result leaves the old working image completely
+   untouched. Tests: `test/backend.test.mjs` "REGRESSION (2nd pass, finding 4)" ×2.
+5. **MAJOR, confirmed real.** `imageGen.generate()` does not apply Lumiverse's native
+   main/style preset or card-level preset — contrary to DESIGN.md §0, which says this
+   extension relies on Lumiverse's own presets rather than storing its own. See the
+   "`generate()` vs `generateNative()`" section above for the full investigation and the
+   switch to `generateNative()`. Test: `test/backend.test.mjs` "REGRESSION (2nd pass,
+   finding 5)" (asserts the exact request shape: `generateNative`, `chat_id`,
+   `promptMode:'custom'`, `skipParse:true`, `characterTags` intact).
+6. **MINOR, confirmed real.** Orphaned images (no live message/tag to regenerate into —
+   that's what made them orphans) still got a "다시 그리기" button in the panel, which
+   either failed immediately or, worse, could target an unrelated surviving record that
+   happened to share the id (finding 3's duplicate-id scenario). Fixed: `frontend.mjs`
+   shows status/reason only for `status:'orphan'` entries, never a regenerate button.
+   Test: `test/frontend.test.mjs` "REGRESSION (2nd pass, finding 6)".
+7. **MINOR, confirmed real.** Turning auto-generation off for a chat also stopped the
+   independent history-cleanup step (stripping rendered image markup down to a short
+   placeholder before it's fed back to the model) — DESIGN.md §4's history-cleanup rule
+   has no such condition; only F1's instruction injection is supposed to depend on the
+   auto-gen flag. Fixed: the interceptor now always runs `stripRenderedImages` on every
+   message regardless of the auto-gen flag, and only gates `injectInstruction` on it.
+   Test: `test/backend.test.mjs` "REGRESSION (2nd pass, finding 7)".
+
+**Bonus (not independently numbered, caught in the same pass):** embedded `"` characters
+in a registry alias were not escaped/stripped before being wrapped in `"..."` for the
+instruction roster, so an alias containing a quote could break out of its own quoting.
+Fixed in `sanitizeAliasForInstruction` (strip `"` along with control chars). Test:
+`test/core.test.mjs` "REGRESSION (review bonus)".
+
+No findings were rejected in this pass either — 7/7 confirmed real, fixed, regression-tested.
 
 ## What was explicitly NOT done (by design, not oversight)
 

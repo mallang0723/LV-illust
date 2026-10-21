@@ -252,3 +252,22 @@ test('REGRESSION: writes are disabled until the current card\'s load actually su
   h.resolveAllPending(() => ({ settings: {}, registry: [], auto: true, images: [] }));
   h.stop();
 });
+
+// ---------------------------------------------------------------- REGRESSION: review (2nd pass) finding 6
+
+test('REGRESSION (2nd pass, finding 6): an orphaned image shows status/reason only, never a regenerate button', async () => {
+  const h = harness({
+    reply: (p) => (p.type === 'list_images'
+      ? { images: [
+        { id: 'p1', messageId: 'm1', summary: 'ok one', imageUrl: 'u1', status: 'ok' },
+        { id: 'p2', messageId: 'm1', summary: 'orphaned one', imageUrl: 'u2', status: 'orphan', reason: '메시지가 바뀌어 넣지 못함' },
+      ] }
+      : undefined),
+  });
+  const modal = await h.open();
+  const regenButtons = [...modal.root.walk()].filter((n) => n.tagName === 'BUTTON' && n.textContent === '다시 그리기');
+  assert.equal(regenButtons.length, 1, 'only the non-orphan image gets a regenerate button');
+  const reasonText = modal.root.find((n) => (n.textContent || '').includes('메시지가 바뀌어 넣지 못함'));
+  assert.ok(reasonText, 'the orphan\'s reason must still be shown');
+  h.stop();
+});

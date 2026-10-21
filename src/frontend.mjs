@@ -223,10 +223,20 @@ export function setup(ctx) {
       return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }),
         el('div', { class: 'lvil-note', text: '그림이 그려진 답변의 말풍선에서 직접 "다시 그리기"를 쓸 수도 있습니다.' }));
     }
-    const rows = view.images.map((img) => el('div', { class: 'lvil-img' },
-      el('img', { src: img.imageUrl || '', alt: '' }),
-      el('div', { class: 'sum', text: img.summary || img.id }),
-      el('button', { type: 'button', disabled: view.busy || !view.ready, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
+    const rows = view.images.map((img) => {
+      const isOrphan = img.status === 'orphan';
+      // Review (2nd pass) finding 6: an orphan has no live message/tag to splice a
+      // regeneration into (that's exactly what made it an orphan) — a "다시 그리기"
+      // button on it either fails immediately (no metadata record under that id any
+      // more) or, worse, targets an unrelated surviving record that happens to share
+      // the id (finding 3's duplicate-id case). Status/reason only, never a button.
+      return el('div', { class: 'lvil-img' },
+        el('img', { src: img.imageUrl || '', alt: '' }),
+        el('div', { class: 'sum', text: img.summary || img.id }),
+        isOrphan
+          ? el('span', { class: 'lvil-note', text: img.reason || '넣지 못함' })
+          : el('button', { type: 'button', disabled: view.busy || !view.ready, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } }));
+    });
     return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }), ...rows);
   }
 

@@ -84,27 +84,27 @@ export function parseTags(content) {
     } else {
       // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
       //
-      // Bug found in review: capturing "through the next '<' (or end of string)" ate
-      // every character of real narrative that followed a broken tag whenever nothing
-      // else in the message started with '<' — e.g. `Before <pic prompt=bad> Important
-      // narrative…` had no second '<' anywhere, so the whole rest of the message (the
-      // narrative) was swallowed into the malformed span and then collapsed into a
-      // 200-char marker summary, destroying the story text. Fix: prefer the *nearest*
-      // '>' as the end of a broken tag attempt (that's almost always where the author
-      // meant to close it, quoting or not — see the repro above, which closes cleanly
-      // at "bad>"), only falling back to the next '<' or a small bound when no '>' is
-      // nearby, so a broken tag can never consume more than a short bounded span of
-      // text that follows it.
+      // This span is now ONLY used to (a) find a short, stable key for "have we already
+      // flagged this exact broken tag" and (b) decide where to resume scanning for more
+      // `<pic` occurrences — it is NEVER used to delete/replace anything any more (see
+      // planMessage/renderMalformedMarker: malformed handling only ever INSERTS a short
+      // marker after the untouched original text, never replaces it). Still bounded to
+      // a small span regardless of which branch is taken — review (2nd pass) finding 1
+      // caught that the `nextLt` fallback below had NO bound at all, so a broken tag
+      // followed by a long stretch of real narrative and then any later '<' (even a
+      // genuine later tag far down the message) made `tag.raw` (and therefore the
+      // dedup key) swallow all of that narrative. Capping every branch at BOUND avoids
+      // that regardless of what used to (and no longer does) happen to the swallowed text.
       const BOUND = 300;
       const nextLt = text.indexOf('<', idx + 4);
       const nextGt = text.indexOf('>', idx + 4);
       let end;
       if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
         end = nextGt + 1; // include the stray '>' — the broken tag's apparent close
-      } else if (nextLt !== -1) {
+      } else if (nextLt !== -1 && nextLt - idx <= BOUND) {
         end = nextLt; // stop before whatever starts next (often a later real tag)
       } else {
-        end = Math.min(idx + BOUND, text.length); // no boundary anywhere nearby: bounded cap only
+        end = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
       }
       out.push({ start: idx, end, raw: text.slice(idx, end), malformed: true, charsRaw: '', promptRaw: '' });
       searchFrom = end;
@@ -236,11 +236,29 @@ export function summarize(text, max = 40) {
 /** Next image id for this message: p1, p2, … — stable/deterministic given how many
  *  ids already exist (so re-processing new tags on an edited message doesn't collide
  *  with ids already used by previously rendered images). */
-export function nextImageId(existingIds) {
+// Review (2nd pass) finding 3: sequential ids derived only from a point-in-time
+// snapshot of "ids already in this message" collide when two handlers (e.g.
+// GENERATION_ENDED and MESSAGE_EDITED firing close together for the same message)
+// each plan from their own snapshot before either has committed — both see "p1" as
+// free and both allocate it, and whichever commits second overwrites the first's
+// metadata record. backend.mjs now also serializes planning+commit per message (a
+// per chatId+messageId lock), which is the primary fix for that specific race — this
+// is defense in depth for it, and the only fix for the same two ids colliding across
+// a worker restart (the in-memory lock doesn't survive one). Collision-resistant by
+// default (time + random, not a small counter); tests inject a deterministic
+// `idGenerator` (e.g. a simple counter) via planMessage's options so assertions on
+// exact ids stay stable without the production path ever being sequential-from-snapshot.
+function randomImageId() {
+  return 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+export function nextImageId(existingIds, idGenerator) {
   const used = new Set(existingIds || []);
-  let n = 1;
-  while (used.has('p' + n)) n++;
-  return 'p' + n;
+  const generate = idGenerator || randomImageId;
+  let id = generate();
+  let guard = 0;
+  while (used.has(id) && guard++ < 1000) id = generate();
+  return id;
 }
 
 export function renderSuccessMarker(id, imageUrl, summaryText) {
@@ -274,12 +292,17 @@ export function renderSkippedMarker(id, tag) {
   return `[한 답변당 그림 상한(2장)을 넘어 건너뜀${shown} · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}">]`;
 }
 
-export function renderMalformedMarker(tag) {
-  // Escape '<' (and the brackets summarize() already strips) so this marker can never
-  // be re-discovered as a `<pic ...>` tag on the next pass (parseTags / handleMessageEdited
-  // would otherwise re-wrap it every time the message is saved, growing without bound).
-  const safe = summarize(tag.raw, 200).replace(/</g, '＜');
-  return `[그림 태그 형식 오류 — 원본: ${safe}]`;
+// Review (2nd pass) finding 1: malformed input must NEVER be removed or summarized —
+// the previous version REPLACED the malformed span with a marker that re-summarized
+// (and therefore truncated/destroyed) the original text. The fixed design never
+// replaces anything for a malformed tag: this fixed, short marker is only ever
+// INSERTED immediately *after* the untouched original text (see planMessage's
+// `{mode:'insert', ...}` entries and backend.mjs's splice loop), so message length can
+// only grow, never shrink, because of malformed-tag handling. No `tag` data is embedded
+// (nothing to escape, nothing to summarize — the real text is right there, intact).
+export const MALFORMED_MARKER_TEXT = ' [⚠️ 그림 태그 형식 오류 — 고치면 다시 시도됩니다]';
+export function renderMalformedMarker() {
+  return MALFORMED_MARKER_TEXT;
 }
 
 // ---------------------------------------------------------------- planning (F2)
@@ -295,40 +318,58 @@ export function renderMalformedMarker(tag) {
  *    need generation (malformed -> malformed marker, overflow valid tags -> skipped
  *    marker). Tags in `jobs` get their marker filled in later from the generation result.
  */
-export function planMessage(content, { registry = [], maxImages = 2, existingImageIds = [] } = {}) {
+export function planMessage(content, { registry = [], maxImages = 2, existingImageIds = [], seenMalformed, idGenerator } = {}) {
   const tags = parseTags(content);
   const jobs = [];
   const skipped = [];
+  const newlyMalformed = [];
+  // markers: tagIndex -> { mode: 'replace' | 'insert', text }. 'replace' swaps the
+  // original tag text out (success/failure/skip — the whole point of F5). 'insert'
+  // (malformed tags only, review finding 1) keeps the original text and only ADDS a
+  // short marker right after it, so malformed handling can never shrink the message.
   const markers = new Map();
+  const seen = seenMalformed instanceof Set ? seenMalformed : new Set();
   const usedIds = existingImageIds.slice();
   let validCount = 0;
   tags.forEach((tag, i) => {
-    if (tag.malformed) { markers.set(i, renderMalformedMarker(tag)); return; }
+    if (tag.malformed) {
+      if (!seen.has(tag.raw)) {
+        markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
+        newlyMalformed.push({ tagIndex: i, raw: tag.raw });
+      }
+      return;
+    }
     validCount++;
     const parsedChars = splitChars(tag.charsRaw);
     const { characterTags, extraFragments } = buildCharacterTags(parsedChars, registry);
     const prompt = assemblePrompt(tag.promptRaw, extraFragments);
-    const id = nextImageId(usedIds);
+    const id = nextImageId(usedIds, idGenerator);
     usedIds.push(id);
     if (validCount > maxImages) {
-      markers.set(i, renderSkippedMarker(id, tag));
+      markers.set(i, { mode: 'replace', text: renderSkippedMarker(id, tag) });
       skipped.push({ tagIndex: i, id, prompt, characterTags, summary: tag.promptRaw });
       return;
     }
     jobs.push({ tagIndex: i, id, prompt, characterTags, summary: tag.promptRaw });
   });
-  return { tags, jobs, skipped, markers };
+  return { tags, jobs, skipped, markers, newlyMalformed };
 }
 
-/** Splice `content` using parseTags-produced `tags` and a parallel replacement map
- *  (tagIndex -> replacement string); tags without an entry are left untouched. */
+/** Splice `content` using parseTags-produced `tags` and a parallel marker map
+ *  (tagIndex -> {mode:'replace'|'insert', text}); tags without an entry are left
+ *  untouched. 'insert' keeps the original tag text and appends `text` right after it
+ *  (never shrinks the message); 'replace' swaps the tag text out for `text`. */
 export function applyMarkers(content, tags, replacements) {
   const text = String(content ?? '');
   let out = '';
   let last = 0;
   tags.forEach((tag, i) => {
+    const original = text.slice(tag.start, tag.end);
     out += text.slice(last, tag.start);
-    out += replacements.has(i) ? replacements.get(i) : text.slice(tag.start, tag.end);
+    const entry = replacements.get(i);
+    if (!entry) out += original;
+    else if (entry.mode === 'insert') out += original + entry.text;
+    else out += entry.text;
     last = tag.end;
   });
   out += text.slice(last);
@@ -343,17 +384,26 @@ const RENDERED_IMG_RE = /!\[그림:[a-z0-9]+\|([^\]]*)\]\([^)]*\)/g;
 // there's no wildcard adjacent to a quote that a prompt containing '>' could break.
 const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed id="[a-z0-9]+">\]/g;
 const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped id="[a-z0-9]+">\]/g;
-const MALFORMED_RE = /\[그림 태그 형식 오류 — 원본: ([^\]]*)\]/g;
+// Matches ONLY our small inserted annotation (MALFORMED_MARKER_TEXT) — the malformed
+// `<pic ...>` text it was inserted after is deliberately left alone (it's not image
+// markup, and the user/model being able to see exactly what they wrote is useful; only
+// our own short annotation is redundant noise in history).
+const MALFORMED_ANNOTATION_RE = new RegExp(MALFORMED_MARKER_TEXT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
 
-/** For prompt assembly over past turns: collapse any of our rendered/failure/skip/
- *  malformed markers down to a short `[그림: ...]` placeholder so image HTML/markdown
- *  and raw tag text are never fed back to the model (design §4, last bullet). */
+/** For prompt assembly over past turns: collapse any of our rendered/failure/skip
+ *  markers down to a short `[그림: ...]` placeholder, and drop the small malformed-tag
+ *  annotation, so image HTML/markdown is never fed back to the model (design §4, last
+ *  bullet) while the user's own (malformed) tag text is never altered or removed.
+ *
+ * Review (2nd pass) finding 7: this must run regardless of the per-chat auto-generation
+ * flag — only F1's instruction injection is conditional on it (see backend.mjs's
+ * interceptor), not this cleanup. */
 export function stripRenderedImages(content) {
   let s = String(content ?? '');
   s = s.replace(RENDERED_IMG_RE, (_, summary) => `[그림: ${summary}]`);
   s = s.replace(FAILED_RE, '[그림: 생성 실패]');
   s = s.replace(SKIPPED_RE, '[그림: 생략됨]');
-  s = s.replace(MALFORMED_RE, (_, raw) => `[그림: ${summarize(raw, 30)}]`);
+  s = s.replace(MALFORMED_ANNOTATION_RE, '');
   return s;
 }
 
@@ -409,6 +459,9 @@ export function normalizeSettings(raw) {
 function sanitizeAliasForInstruction(name) {
   return String(name ?? '')
     .replace(/[\u0000-\u001f\u007f]/g, ' ') // control chars incl. newlines -> space
+    .replace(/"/g, '') // review (2nd pass): strip quotes too — the roster wraps every
+    // alias in literal "..." for the AI, and an un-escaped embedded quote would break
+    // that quoting (e.g. name `보라"장난꾼` rendered as `"보라"장난꾼"`, ambiguous).
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80);
@@ -691,10 +744,20 @@ export function setup(ctx) {
       return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }),
         el('div', { class: 'lvil-note', text: '그림이 그려진 답변의 말풍선에서 직접 "다시 그리기"를 쓸 수도 있습니다.' }));
     }
-    const rows = view.images.map((img) => el('div', { class: 'lvil-img' },
-      el('img', { src: img.imageUrl || '', alt: '' }),
-      el('div', { class: 'sum', text: img.summary || img.id }),
-      el('button', { type: 'button', disabled: view.busy || !view.ready, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
+    const rows = view.images.map((img) => {
+      const isOrphan = img.status === 'orphan';
+      // Review (2nd pass) finding 6: an orphan has no live message/tag to splice a
+      // regeneration into (that's exactly what made it an orphan) — a "다시 그리기"
+      // button on it either fails immediately (no metadata record under that id any
+      // more) or, worse, targets an unrelated surviving record that happens to share
+      // the id (finding 3's duplicate-id case). Status/reason only, never a button.
+      return el('div', { class: 'lvil-img' },
+        el('img', { src: img.imageUrl || '', alt: '' }),
+        el('div', { class: 'sum', text: img.summary || img.id }),
+        isOrphan
+          ? el('span', { class: 'lvil-note', text: img.reason || '넣지 못함' })
+          : el('button', { type: 'button', disabled: view.busy || !view.ready, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } }));
+    });
     return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }), ...rows);
   }
 

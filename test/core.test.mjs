@@ -72,10 +72,10 @@ test('parseTags: rendered/failed/skipped/malformed markers never re-match (idemp
   }
 });
 
-test('renderMalformedMarker: never embeds a literal "<" (would re-match as a live tag on the next pass)', () => {
-  const marker = C.renderMalformedMarker({ raw: '<pic foo="bar">' });
+test('renderMalformedMarker: fixed short text, never embeds a literal "<" (would re-match as a live tag on the next pass)', () => {
+  const marker = C.renderMalformedMarker();
   assert.ok(!marker.includes('<'));
-  assert.ok(marker.includes('＜pic'));
+  assert.equal(marker, C.MALFORMED_MARKER_TEXT);
 });
 
 // ---------------------------------------------------------------- splitChars
@@ -108,6 +108,13 @@ test('splitChars: stray empty entries are dropped', () => {
     { name: '아드리안', action: '' }, { name: '정수빈', action: '' },
   ]);
 });
+
+// Deterministic id generator for tests that assert exact ids — production code never
+// passes one (see core.mjs nextImageId: review finding 3, collision-resistant by default).
+function counterIdGen(start = 0) {
+  let n = start;
+  return () => 'p' + (++n);
+}
 
 // ---------------------------------------------------------------- name matching
 
@@ -189,11 +196,12 @@ test('planMessage: max 2 images — 3rd+ valid tag gets a skipped marker, not a 
   assert.equal(skipped.length, 1);
   assert.equal(skipped[0].tagIndex, 2);
   assert.equal(markers.size, 1);
-  const [[idx, text]] = [...markers.entries()];
+  const [[idx, entry]] = [...markers.entries()];
   assert.equal(idx, 2);
-  assert.ok(text.includes('상한'));
-  assert.ok(text.includes('"3"')); // summary of the promptRaw, not a raw prompt="..." attribute any more
-  assert.ok(text.includes(`id="${skipped[0].id}"`));
+  assert.equal(entry.mode, 'replace');
+  assert.ok(entry.text.includes('상한'));
+  assert.ok(entry.text.includes('"3"')); // summary of the promptRaw, not a raw prompt="..." attribute any more
+  assert.ok(entry.text.includes(`id="${skipped[0].id}"`));
 });
 
 test('planMessage: malformed tag always gets a marker, never a job, never counted toward the limit', () => {
@@ -201,40 +209,74 @@ test('planMessage: malformed tag always gets a marker, never a job, never counte
   const { jobs, markers } = C.planMessage(content, { registry: [], maxImages: 2 });
   assert.equal(jobs.length, 2); // both real tags still get generated
   assert.equal(markers.size, 1);
-  assert.ok([...markers.values()][0].includes('형식 오류'));
+  const entry = [...markers.values()][0];
+  assert.equal(entry.mode, 'insert'); // never 'replace' — malformed text must never be removed
+  assert.ok(entry.text.includes('형식 오류'));
 });
 
-test('planMessage: image ids are unique and avoid existingImageIds', () => {
+test('planMessage: malformed tag marked "seen" once is never re-flagged on a later pass', () => {
+  const content = '<pic foo="bar"> narrative continues';
+  const first = C.planMessage(content, { registry: [] });
+  assert.equal(first.markers.size, 1);
+  assert.equal(first.newlyMalformed.length, 1);
+  const seen = new Set(first.newlyMalformed.map((m) => m.raw));
+  const second = C.planMessage(content, { registry: [], seenMalformed: seen });
+  assert.equal(second.markers.size, 0); // already seen — no new marker, no re-flag
+  assert.equal(second.newlyMalformed.length, 0);
+});
+
+test('planMessage: image ids are unique, avoid existingImageIds, and are never bare sequential by default', () => {
   const content = '<pic prompt="1"><pic prompt="2">';
   const { jobs } = C.planMessage(content, { registry: [], maxImages: 2, existingImageIds: ['p1'] });
+  assert.equal(jobs.length, 2);
+  assert.equal(new Set(jobs.map((j) => j.id)).size, 2); // unique
+  for (const j of jobs) assert.notEqual(j.id, 'p1'); // avoids the existing id
+  // production default is collision-resistant (time+random), not "p2"/"p3"
+  for (const j of jobs) assert.ok(/^p[a-z0-9]{6,}$/.test(j.id), j.id);
+});
+
+test('planMessage: a deterministic idGenerator (as tests use) still avoids existingImageIds', () => {
+  const content = '<pic prompt="1"><pic prompt="2">';
+  const { jobs } = C.planMessage(content, { registry: [], maxImages: 2, existingImageIds: ['p1'], idGenerator: counterIdGen() });
   assert.deepEqual(jobs.map((j) => j.id), ['p2', 'p3']);
 });
 
 // ---------------------------------------------------------------- applyMarkers (splicing)
 
-test('applyMarkers: replaces only tags with an entry in the map, preserves surrounding text', () => {
+test('applyMarkers: "replace" swaps the tag out; tags without an entry are left untouched', () => {
   const content = 'A <pic prompt="1"> B <pic prompt="2"> C';
   const tags = C.parseTags(content);
-  const out = C.applyMarkers(content, tags, new Map([[0, '[IMG1]']]));
+  const out = C.applyMarkers(content, tags, new Map([[0, { mode: 'replace', text: '[IMG1]' }]]));
   assert.equal(out, 'A [IMG1] B <pic prompt="2"> C');
 });
 
 test('applyMarkers: replacing both tags produces exact splice with no drift', () => {
   const content = 'A <pic prompt="1"> B <pic prompt="2"> C';
   const tags = C.parseTags(content);
-  const out = C.applyMarkers(content, tags, new Map([[0, '[X]'], [1, '[Y]']]));
+  const out = C.applyMarkers(content, tags, new Map([
+    [0, { mode: 'replace', text: '[X]' }], [1, { mode: 'replace', text: '[Y]' }],
+  ]));
   assert.equal(out, 'A [X] B [Y] C');
+});
+
+test('applyMarkers: "insert" keeps the original tag text intact and only appends after it', () => {
+  const content = 'A <pic foo="bad"> B';
+  const tags = C.parseTags(content);
+  const out = C.applyMarkers(content, tags, new Map([[0, { mode: 'insert', text: '[NOTE]' }]]));
+  assert.equal(out, 'A <pic foo="bad">[NOTE] B');
+  assert.ok(out.length >= content.length); // never shrinks
 });
 
 test('full pipeline: plan -> generate (simulated) -> apply markers for a 3-tag message with one malformed', () => {
   const content = '<pic chars="아드리안" prompt="1"><pic foo="bad"><pic prompt="2"><pic prompt="3">';
-  const { tags, jobs, markers } = C.planMessage(content, { registry: REGISTRY, maxImages: 2 });
+  const { tags, jobs, markers } = C.planMessage(content, { registry: REGISTRY, maxImages: 2, idGenerator: counterIdGen() });
   // jobs[0] (tag 0) and jobs[1] (tag 2) get generated; tag 1 malformed; tag 3 skipped (3rd valid)
   assert.equal(jobs.length, 2);
   assert.equal(jobs[0].tagIndex, 0);
   assert.equal(jobs[1].tagIndex, 2);
-  for (const job of jobs) markers.set(job.tagIndex, C.renderSuccessMarker(job.id, 'https://img/' + job.id, job.summary));
+  for (const job of jobs) markers.set(job.tagIndex, { mode: 'replace', text: C.renderSuccessMarker(job.id, 'https://img/' + job.id, job.summary) });
   const out = C.applyMarkers(content, tags, markers);
+  assert.ok(out.includes('<pic foo="bad">')); // malformed tag's original text survives verbatim
   assert.ok(out.includes('![그림:p1|1]'));
   assert.ok(out.includes('형식 오류'));
   assert.ok(out.includes('![그림:p2|2]'));
@@ -249,13 +291,13 @@ test('stripRenderedImages: converts a rendered image into a short placeholder', 
   assert.equal(out, '그는 웃었다. [그림: 골목에서 마주친 아드리안] 그리고 떠났다.');
 });
 
-test('stripRenderedImages: converts failure/skip/malformed markers too', () => {
+test('stripRenderedImages: converts failure/skip markers too, and drops the malformed annotation while keeping the original tag text', () => {
   const failed = C.renderFailureMarker('p1', { charsRaw: 'a', promptRaw: 'b', raw: '<pic prompt="b">' }, '시간 초과');
   const skipped = C.renderSkippedMarker('p2', { charsRaw: 'a', promptRaw: 'b' });
-  const bad = C.renderMalformedMarker({ raw: '<pic broken' });
   assert.equal(C.stripRenderedImages(failed), '[그림: 생성 실패]');
   assert.equal(C.stripRenderedImages(skipped), '[그림: 생략됨]');
-  assert.ok(C.stripRenderedImages(bad).startsWith('[그림: '));
+  const malformedInSitu = '<pic foo="bad">' + C.renderMalformedMarker() + ' 나머지 이야기';
+  assert.equal(C.stripRenderedImages(malformedInSitu), '<pic foo="bad"> 나머지 이야기');
 });
 
 test('stripRenderedImages: idempotent — running twice is the same as running once', () => {
@@ -358,7 +400,7 @@ test('normalizeRegistry: enabled defaults true unless explicitly false', () => {
 
 // ---------------------------------------------------------------- review regressions
 
-test('REGRESSION (review finding 2): a malformed tag never eats narrative that follows it', () => {
+test('REGRESSION (review finding 2, round 1): a malformed tag never eats narrative that follows it', () => {
   // Original bug: no closing '>' was found for this broken tag AND no further '<'
   // existed anywhere in the message, so the old code took "the rest of the string" as
   // the malformed span and collapsed it to a 200-char marker summary, destroying the
@@ -369,23 +411,50 @@ test('REGRESSION (review finding 2): a malformed tag never eats narrative that f
   assert.equal(tags.length, 1);
   assert.equal(tags[0].malformed, true);
   assert.equal(tags[0].raw, '<pic prompt=bad>'); // only the broken tag itself, not the prose after it
-  const marker = C.renderMalformedMarker(tags[0]);
-  const out = C.applyMarkers(content, tags, new Map([[0, marker]]));
+  const out = C.applyMarkers(content, tags, new Map([[0, { mode: 'insert', text: C.renderMalformedMarker() }]]));
   assert.ok(out.includes(narrative), 'narrative text must survive verbatim');
   assert.ok(out.startsWith('Before '));
+  assert.ok(out.length >= content.length, 'malformed handling must never shrink the message');
 });
 
-test('REGRESSION (review finding 2): a truly unterminated tag with nothing nearby is still bounded, not unlimited', () => {
+test('REGRESSION (review finding 2, round 1): a truly unterminated tag with nothing nearby is still bounded, not unlimited', () => {
   const narrative = '그 뒤로 아주 긴 이야기가 이어졌다. '.repeat(50); // well over the 300-char bound, no '>' or '<' anywhere
   const content = `<pic prompt="never closes ${narrative}`;
   const tags = C.parseTags(content);
   assert.equal(tags.length, 1);
   assert.equal(tags[0].malformed, true);
-  assert.ok(tags[0].raw.length <= 300);
-  // some of the narrative is unavoidably inside the malformed span here (there is
-  // nothing in the text to tell "broken tag" apart from "prose" when the tag's own
-  // quote never closes), but it is bounded and not the literal full remaining message.
-  assert.ok(tags[0].raw.length < content.length);
+  assert.ok(tags[0].raw.length <= 300); // the DETECTION span is still bounded (dedup-key hygiene)...
+  const out = C.applyMarkers(content, tags, new Map([[0, { mode: 'insert', text: C.renderMalformedMarker() }]]));
+  // ...but nothing is ever actually deleted any more: peeling the inserted marker back
+  // out (wherever in the middle it landed) recovers the original exactly.
+  assert.equal(out.split(C.MALFORMED_MARKER_TEXT).join(''), content);
+  assert.ok(out.length > content.length);
+});
+
+test('REGRESSION (review finding 1, round 2 — exact repro): an unterminated tag followed by ~2000 chars of ' +
+  'narrative and then an unrelated later "<" must not destroy the message', () => {
+  // Codex's round-2 repro: an unterminated tag, long prose, then ANY later '<' (not
+  // necessarily another <pic). The old `nextLt` fallback had no bound at all, so `end`
+  // landed at that far-away '<' and the entire narrative in between became "the
+  // malformed span" — which then got summarized away to ~200 chars. A 2,030-char
+  // message was reduced to 230. Reproduced here at the same order of magnitude, with a
+  // literal non-tag '<' (e.g. a stray math/comparison symbol) far down the message.
+  const sentence = '그 뒤로 아주 긴 이야기가 끝없이 이어지고 또 이어졌다. ';
+  const narrative = sentence.repeat(Math.ceil(2000 / sentence.length));
+  const content = `시작 <pic prompt=bad broken ${narrative} 1 < 2 였다.`; // the "1 < 2" supplies a distant '<'
+  assert.ok(content.length > 2000, 'repro must be on the same order of magnitude as the reported case');
+  const originalLength = content.length;
+  const tags = C.parseTags(content);
+  assert.equal(tags.length, 1);
+  assert.equal(tags[0].malformed, true);
+  const markers = new Map([[0, { mode: 'insert', text: C.renderMalformedMarker() }]]);
+  const out = C.applyMarkers(content, tags, markers);
+  assert.ok(out.length >= originalLength, `message must never shrink: ${originalLength} -> ${out.length}`);
+  // The strongest possible check for "never removed or summarized": peeling the
+  // inserted marker(s) back out must recover the ORIGINAL content exactly, byte for
+  // byte — regardless of exactly where in the middle the marker landed.
+  const recovered = out.split(C.MALFORMED_MARKER_TEXT).join('');
+  assert.equal(recovered, content, 'removing the inserted marker(s) must exactly recover the original message');
 });
 
 test('REGRESSION (review finding 5): a registered alias never matches as a bare prefix of an unrelated word', () => {
@@ -430,4 +499,11 @@ test('REGRESSION (review finding 7): aliases are presented as quoted data in the
   const registry = [{ id: 'c0', names: ['아드리안'], appearance: 'x', enabled: true }];
   const text = C.buildInstructionText(registry);
   assert.ok(text.includes('"아드리안"'));
+});
+
+test('REGRESSION (review bonus): an embedded quote in an alias cannot break the roster\'s quoting', () => {
+  const registry = [{ id: 'c0', names: ['보라"장난꾼'], appearance: 'x', enabled: true }];
+  const text = C.buildInstructionText(registry);
+  assert.ok(text.includes('"보라장난꾼"')); // quote stripped, not left to break out of the "..." wrapper
+  assert.ok(!text.includes('"보라"장난꾼"'));
 });

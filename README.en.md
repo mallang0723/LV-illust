@@ -15,11 +15,11 @@ prompt slots (`characterTags`).
 | # | What it does |
 |---|---|
 | F1 | Before generation, injects an instruction ("if a picture is needed, write `<pic chars="name" prompt="scene">`") into the prompt. Position/depth/role are configurable. |
-| F2 | On generation end, finds `<pic>` tags in the reply and renders them one by one. Max 2 images per reply (configurable); extra tags get a visible "skipped" marker, malformed tags get a visible "format error" marker — both keep the original text recoverable and can be regenerated later from the panel. |
-| F3 | Matches names in a tag against the registry (multiple aliases per character, longest-alias-first, case/whitespace-insensitive), substitutes the registered appearance prompt, and routes it to NAI's character slot. Unregistered or disabled characters fall back to whatever the AI itself described in the scene text. |
+| F2 | On generation end, finds `<pic>` tags in the reply and renders them one by one. Max 2 images per reply (configurable); extra tags get a visible "skipped" marker. A malformed tag's original text is **never deleted or summarized** — it's left byte-for-byte in place, with only a short marker appended right next to it (message length never shrinks because of malformed-tag handling). |
+| F3 | Matches names in a tag against the registry (multiple aliases per character, longest-alias-first, case/whitespace-insensitive, a partial match only counts at a real word boundary), substitutes the registered appearance prompt, and routes it to NAI's character slot. Unregistered or disabled characters fall back to whatever the AI itself described in the scene text. |
 | F4 | A per-character-card appearance registry (names, appearance prompt, on/off), shared across every chat using that card. **Starts empty** — nothing is pre-seeded. |
-| F5 | Renders the image directly in place of the tag (`chat.updateMessage`). Failures, over-the-cap skips, and malformed tags each get a distinct, recoverable marker; the original tag data is kept in message metadata. |
-| F6 | The input-bar "삽화가 설정" (Illustrator Settings) panel lists this chat's generated images with a "다시 그리기" (regenerate) button. If the message changed (edited/swiped) while a generation was in flight, the image is never discarded — it's kept as a recoverable "couldn't place" entry in that same panel instead. |
+| F5 | Renders the image directly in place of the tag (`chat.updateMessage`). Failures and over-the-cap skips each get a distinct, recoverable marker; the original tag data is kept in message metadata. Generation goes through Lumiverse's own `imageGen.generateNative` (so the user's own style/LoRA preset composes onto the prompt). |
+| F6 | The input-bar "삽화가 설정" (Illustrator Settings) panel lists this chat's generated images with a "다시 그리기" (regenerate) button. If the message changed (edited/swiped) while a generation was in flight, the image is never discarded — it's kept as a recoverable, status-only entry (no regenerate button — there's nowhere left to put it) in that same panel instead. |
 
 Lumiverse's own main/style prompt presets, per-card presets, and auto-scene generation are
 left untouched — this extension only adds "in-reply picture tags" + "per-character
@@ -59,12 +59,15 @@ flow works as-is.)
 - Whether Lumiverse's chat view actually renders the markdown image syntax
   (`![...](...)`) this extension writes as a visible picture was never confirmed against
   a live server. Test with one real `<pic prompt="...">` after installing.
+- The code path that composes the user's native style/LoRA preset onto the prompt via
+  `generateNative` was confirmed by reading the actual implementation, but whether it
+  visibly shows up in a real generated image hasn't been confirmed live.
 - The `MESSAGE_EDITED` event's payload shape is inferred (no type definition exists for
   it). If the guess is wrong, the handler fails safe — it does nothing rather than acting
   on bad data.
 - If a message is edited or swiped while a generation for it is still in flight, the
   image is never spliced into the (now different) message — it's kept as a recoverable,
-  un-auto-retried entry visible in the panel instead.
+  un-auto-retried, status-only entry visible in the panel instead (no regenerate button).
 
 See `docs/API-NOTES.md` for the evidence behind every API claim (file:line,
 VERIFIED/INFERRED/UNVERIFIED).

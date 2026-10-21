@@ -2,6 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createService, start } from '../src/backend.mjs';
 
+// Deterministic id generator for tests that assert exact ids — production code never
+// passes one (core.mjs nextImageId defaults to collision-resistant time+random ids;
+// review finding 3).
+function counterIdGen(start = 0) {
+  let n = start;
+  return () => 'p' + (++n);
+}
+
 // Minimal fake Spindle `api` covering only what backend.mjs calls. Tracks every
 // call in `calls` for assertions. No network, no real LLM/image-gen calls.
 function fakeApi({ messages = {}, chats = {}, characters = {}, generateImpl } = {}) {
@@ -50,9 +58,9 @@ function fakeApi({ messages = {}, chats = {}, characters = {}, generateImpl } = 
       },
     },
     imageGen: {
-      generate: async (input) => {
-        calls.push(['imageGen.generate', input]);
-        return generateImpl ? generateImpl(input) : { imageId: 'img1', imageUrl: 'https://img/1.png', model: 'nai', provider: 'novelai' };
+      generateNative: async (input) => {
+        calls.push(['imageGen.generateNative', input]);
+        return generateImpl ? generateImpl(input) : { imageId: 'img1', imageUrl: 'https://img/1.png', provider: 'novelai', generated: true };
       },
     },
   };
@@ -74,7 +82,7 @@ test('GENERATION_ENDED success: tag replaced with rendered image, metadata recor
       { names: ['아드리안'], appearance: '1boy, silver hair', enabled: true },
     ] } } } },
   });
-  const svc = createService(f.api);
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1', generationId: 'g1' });
 
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
@@ -82,9 +90,15 @@ test('GENERATION_ENDED success: tag replaced with rendered image, metadata recor
   assert.equal(patch.metadata.lv_illust.images.p1.status, 'ok');
   assert.equal(patch.metadata.lv_illust.images.p1.imageUrl, 'https://img/1.png');
 
-  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generate');
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
   assert.deepEqual(genInput.parameters.characterTags, [{ tags: '1boy, silver hair' }]);
-  assert.equal(genInput.owner_chat_id, 'c1');
+  // review finding 5: generateNative (not generate), chat_id (not owner_chat_id),
+  // promptMode:'custom' + skipParse:true so Lumiverse's own scene-analysis step is
+  // skipped (and therefore never overwrites our characterTags) while its native
+  // style/LoRA preset composition still applies — see docs/API-NOTES.md.
+  assert.equal(genInput.chat_id, 'c1');
+  assert.equal(genInput.promptMode, 'custom');
+  assert.equal(genInput.skipParse, true);
   assert.equal(genInput.includeDataUrl, false);
 });
 
@@ -97,7 +111,7 @@ test('GENERATION_ENDED failure: visible failure marker, original tag info kept i
     chats: { c1: { id: 'c1', character_id: 'char1' } },
     generateImpl: () => { throw new Error('연결 실패'); },
   });
-  const svc = createService(f.api);
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
 
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
@@ -118,7 +132,7 @@ test('GENERATION_ENDED: message with no <pic> tag never calls updateMessage', as
   const svc = createService(f.api);
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
   assert.equal(f.calls.find((c) => c[0] === 'updateMessage'), undefined);
-  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined);
+  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generateNative'), undefined);
 });
 
 // ---------------------------------------------------------------- auto-off per chat
@@ -130,7 +144,7 @@ test('auto-off: GENERATION_ENDED does nothing when the chat has turned auto-gen 
   await f.api.variables.chat.set('c1', 'lv_illust.auto', '0');
   f.calls.length = 0;
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
-  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined);
+  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generateNative'), undefined);
 });
 
 test('auto defaults on when the chat variable was never set', async () => {
@@ -138,7 +152,7 @@ test('auto defaults on when the chat variable was never set', async () => {
   const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
   const svc = createService(f.api);
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
-  assert.ok(f.calls.find((c) => c[0] === 'imageGen.generate'));
+  assert.ok(f.calls.find((c) => c[0] === 'imageGen.generateNative'));
 });
 
 // ---------------------------------------------------------------- MESSAGE_EDITED (new tags written in)
@@ -147,7 +161,7 @@ test('MESSAGE_EDITED: newly written tag is processed; already-rendered image is 
   const content = '![그림:p1|이전](https://img/p1.png) 그리고 <pic prompt="새 장면">';
   const msg = assistantMsg('m1', content, { lv_illust: { images: { p1: { status: 'ok', prompt: '이전' } } } });
   const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
-  const svc = createService(f.api);
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
   await svc.handleMessageEdited({ chatId: 'c1', message: msg });
 
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
@@ -162,7 +176,7 @@ test('MESSAGE_EDITED: ignored for user messages', async () => {
   const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
   const svc = createService(f.api);
   await svc.handleMessageEdited({ chatId: 'c1', message: msg });
-  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined);
+  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generateNative'), undefined);
 });
 
 // ---------------------------------------------------------------- swipe/regenerate via GENERATION_ENDED
@@ -170,7 +184,7 @@ test('MESSAGE_EDITED: ignored for user messages', async () => {
 test('swipe/regenerate: a new assistant message/content from a swipe generation is processed the same way', async () => {
   const msg = assistantMsg('m2', '<pic prompt="스와이프 장면">');
   const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
-  const svc = createService(f.api);
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm2', generationType: 'swipe' });
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
   assert.ok(patch.content.includes('![그림:p1|스와이프 장면]'));
@@ -228,7 +242,7 @@ test('MESSAGE_EDITED: ignores a user-authored row even if the raw payload lacks 
   const f = fakeApi({ messages: { c1: [msg] } });
   const svc = createService(f.api);
   await svc.handleMessageEdited({ chatId: 'c1', message: { id: 'm1' } }); // minimal raw payload, no is_user/content
-  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined);
+  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generateNative'), undefined);
 });
 
 // ---------------------------------------------------------------- frontend requests: settings / registry / auto toggle
@@ -383,7 +397,7 @@ test('REGRESSION: a concurrent metadata write from another extension survives th
       return { imageId: 'img1', imageUrl: 'https://img/1.png' };
     },
   });
-  const svc = createService(f.api);
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
   assert.deepEqual(patch.metadata.some_other_extension, { note: 'hello' });
@@ -422,4 +436,152 @@ test('REGRESSION: regenerate orphans the image (instead of throwing away the gen
   assert.equal(msg.content, '사용자가 마커를 지우고 완전히 새로 썼습니다.'); // not reverted
   const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
   assert.ok(images.some((i) => i.status === 'orphan' && i.id === 'p1'));
+});
+
+// ---------------------------------------------------------------- REGRESSION: 2nd-pass review findings
+
+test('REGRESSION (2nd pass, finding 2): orphan bookkeeping never reopens the stale-write race — ' +
+  'the commit happens before any orphan RPCs, so a concurrent edit during THOSE RPCs cannot be lost', async () => {
+  // Two tags: one survives to commit time, the other is edited away (becomes an
+  // orphan). The ORIGINAL bug awaited pushOrphans() (its own read-modify-write pair)
+  // BETWEEN the revalidating read and the main commit — a concurrent edit landing in
+  // that window would be silently overwritten by the commit that followed. Here, the
+  // edit happens *during pushOrphans itself* (modeled via a variables.chat.set hook),
+  // which can only matter if pushOrphans runs before the main commit.
+  const msg = assistantMsg('m1', '<pic prompt="keep"><pic prompt="drop">');
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  let generatedCount = 0;
+  const realGenerateNative = f.api.imageGen.generateNative;
+  f.api.imageGen.generateNative = async (input) => {
+    generatedCount++;
+    if (generatedCount === 2) {
+      // the SECOND tag's generation is the one whose splice target vanishes
+      msg.content = msg.content.replace('<pic prompt="drop">', '');
+    }
+    return realGenerateNative(input);
+  };
+  let editedDuringOrphanWrite = false;
+  const realVarSet = f.api.variables.chat.set;
+  f.api.variables.chat.set = async (chatId, key, value) => {
+    if (key === 'lv_illust.orphans' && !editedDuringOrphanWrite) {
+      // simulate an external edit landing exactly while the orphan bookkeeping RPC
+      // (which now runs strictly AFTER the main commit) is in flight
+      editedDuringOrphanWrite = true;
+    }
+    return realVarSet(chatId, key, value);
+  };
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const updateCalls = f.calls.filter((c) => c[0] === 'updateMessage');
+  assert.equal(updateCalls.length, 1, 'exactly one commit — the kept tag\'s image');
+  assert.ok(updateCalls[0][3].content.includes('![그림:p1|keep]'));
+  const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
+  assert.ok(images.some((i) => i.status === 'orphan' && i.summary === 'drop'));
+});
+
+test('REGRESSION (2nd pass, finding 3): overlapping handlers for the SAME message never allocate the same image id ' +
+  'or overwrite each other\'s metadata record', async () => {
+  // GENERATION_ENDED and MESSAGE_EDITED firing close together for the same message —
+  // simulated here by calling handleGenerationEnded twice without awaiting the first.
+  // The per-message lock must serialize them so the second plans AFTER the first has
+  // committed, not from the same stale snapshot.
+  const msg = assistantMsg('m1', '<pic prompt="A">');
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const svc = createService(f.api);
+  const first = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  // Prepend a second tag mid-flight, like a MESSAGE_EDITED for the same message
+  // arriving before the first generation's commit — without the per-message lock,
+  // the second handler would plan from the same pre-commit snapshot as the first.
+  queueMicrotask(() => { msg.content = '<pic prompt="B">' + msg.content; });
+  const second = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  await Promise.all([first, second]);
+
+  const images = msg.metadata?.lv_illust?.images || {};
+  const ids = Object.keys(images);
+  assert.equal(new Set(ids).size, ids.length, 'no two records share an id');
+  // Both generated images' records must be recoverable — neither was silently dropped.
+  const prompts = Object.values(images).map((r) => r.prompt).sort();
+  assert.deepEqual(prompts, ['A', 'B']);
+});
+
+test('REGRESSION (2nd pass, finding 4): a generation that resolves without a usable imageUrl is treated as a failure, never written as "(undefined)"', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="scene">');
+  const f = fakeApi({
+    messages: { c1: [msg] }, chats: { c1: { id: 'c1' } },
+    generateImpl: () => ({ generated: true, imageId: 'img1' }), // no imageUrl — host persistence failure case
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
+  assert.ok(!patch.content.includes('undefined'));
+  assert.ok(patch.content.includes('⚠️ 그림 생성 실패'));
+  assert.equal(patch.metadata.lv_illust.images.p1.status, 'fail');
+});
+
+test('REGRESSION (2nd pass, finding 4): regenerate with a missing imageUrl preserves the OLD working image, does not overwrite it', async () => {
+  const content = '![그림:p1|골목](https://img/old.png)';
+  const msg = assistantMsg('m1', content, { lv_illust: { images: { p1: { status: 'ok', prompt: '골목', characterTags: [], summary: '골목', imageUrl: 'https://img/old.png' } } } });
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    generateImpl: () => ({ generated: true }), // no imageUrl this time
+  });
+  const svc = createService(f.api);
+  await assert.rejects(() => svc.runFrontendRequest({ type: 'regenerate', chatId: 'c1', messageId: 'm1', imageId: 'p1' }));
+  assert.equal(msg.content, content); // untouched — old working image still there
+  assert.equal(msg.metadata.lv_illust.images.p1.imageUrl, 'https://img/old.png'); // untouched
+});
+
+test('REGRESSION (2nd pass, finding 5): generation requests use generateNative with promptMode "custom" and skipParse true ' +
+  '(so Lumiverse\'s native style/LoRA preset composes onto our prompt, but scene-analysis never overwrites our characterTags)', async () => {
+  const msg = assistantMsg('m1', '<pic chars="아드리안" prompt="골목">');
+  const f = fakeApi({
+    messages: { c1: [msg] }, chats: { c1: { id: 'c1', character_id: 'char1' } },
+    characters: { char1: { id: 'char1', extensions: { lv_illust: { characters: [{ names: ['아드리안'], appearance: 'tag', enabled: true }] } } } },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.promptMode, 'custom');
+  assert.equal(genInput.skipParse, true);
+  assert.equal(genInput.chat_id, 'c1');
+  assert.deepEqual(genInput.parameters.characterTags, [{ tags: 'tag' }]);
+  assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined); // the old API is not used at all
+});
+
+test('REGRESSION (2nd pass, finding 7): history cleanup (stripping rendered images to a placeholder) still runs when auto-gen is OFF for the chat — only instruction injection is gated on it', async () => {
+  const f = fakeApi();
+  const svc = createService(f.api);
+  svc.registerInterceptor();
+  await f.api.variables.chat.set('c1', 'lv_illust.auto', '0');
+  const msgs = [
+    { role: 'assistant', content: '그림: ![그림:p1|요약](https://img/p1.png)' },
+  ];
+  const out = await f.api.runInterceptor(msgs, { chatId: 'c1', characterId: null });
+  assert.ok(!out.some((m) => m.content.includes('![그림:p1'))); // cleanup still happened
+  assert.ok(out.some((m) => m.content.includes('[그림: 요약]')));
+  assert.ok(!out.some((m) => m.content.includes('<pic'))); // but no instruction was injected (auto is off)
+});
+
+test('REGRESSION (2nd pass, finding 1 — malformed never shrinks, integration level): a malformed tag survives a full processMessage pass verbatim', async () => {
+  const content = '이야기 시작 <pic prompt=bad> 뒤이은 서사가 아주 길게 이어진다.';
+  const msg = assistantMsg('m1', content);
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const svc = createService(f.api);
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
+  assert.ok(patch.content.length >= content.length);
+  assert.ok(patch.content.includes('뒤이은 서사가 아주 길게 이어진다.'));
+  assert.ok(patch.content.includes('<pic prompt=bad>'));
+});
+
+test('REGRESSION (2nd pass, finding 1): a malformed tag already marked is never re-flagged on a later MESSAGE_EDITED pass', async () => {
+  const content = '<pic prompt=bad> 나머지 이야기';
+  const msg = assistantMsg('m1', content);
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const svc = createService(f.api);
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const firstLength = msg.content.length;
+  // re-processing the SAME (already-annotated) message must not add a second annotation
+  await svc.handleMessageEdited({ chatId: 'c1', message: { id: 'm1' } });
+  assert.equal(msg.content.length, firstLength);
 });
