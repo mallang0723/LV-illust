@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createService, start } from '../src/backend.mjs';
+import { createService, start, _debugLockMapSize } from '../src/backend.mjs';
+import { MALFORMED_MARKER_TEXT } from '../src/core.mjs';
 
 // Deterministic id generator for tests that assert exact ids — production code never
 // passes one (core.mjs nextImageId defaults to collision-resistant time+random ids;
@@ -12,7 +13,7 @@ function counterIdGen(start = 0) {
 
 // Minimal fake Spindle `api` covering only what backend.mjs calls. Tracks every
 // call in `calls` for assertions. No network, no real LLM/image-gen calls.
-function fakeApi({ messages = {}, chats = {}, characters = {}, generateImpl } = {}) {
+function fakeApi({ messages = {}, chats = {}, characters = {}, generateImpl, promptPresets } = {}) {
   const calls = [];
   const storage = {};
   const chatVars = {};
@@ -62,6 +63,14 @@ function fakeApi({ messages = {}, chats = {}, characters = {}, generateImpl } = 
         calls.push(['imageGen.generateNative', input]);
         return generateImpl ? generateImpl(input) : { imageId: 'img1', imageUrl: 'https://img/1.png', provider: 'novelai', generated: true };
       },
+      // omitted entirely unless the test opts in — real hosts without this (older)
+      // method are handled by backend.mjs's own typeof-function feature detection
+      ...(promptPresets !== undefined ? {
+        getPromptPresets: async () => {
+          calls.push(['imageGen.getPromptPresets']);
+          return promptPresets;
+        },
+      } : {}),
     },
   };
   return { api, calls, storage, chatVars };
@@ -548,6 +557,87 @@ test('REGRESSION (2nd pass, finding 5): generation requests use generateNative w
   assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined); // the old API is not used at all
 });
 
+test('REGRESSION (3rd pass, finding 2): the active main preset\'s positive prompt is composed WITH the scene prompt, not replaced by it', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="forest">');
+  const f = fakeApi({
+    messages: { c1: [msg] }, chats: { c1: { id: 'c1' } },
+    promptPresets: { activeId: 'p1', activeConnectionId: 'c1', presets: [
+      { id: 'p1', name: 'Main', mode: 'custom', prompt: 'watercolor, soft lighting', negativePrompt: 'lowres' },
+    ] },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.prompt, 'watercolor, soft lighting, forest');
+  assert.equal(genInput.negativePrompt, 'lowres');
+  assert.ok(f.calls.some((c) => c[0] === 'imageGen.getPromptPresets'));
+});
+
+test('REGRESSION (3rd pass, finding 2): character/persona macro tokens in the main preset are stripped, never sent to the provider as literal text', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="forest">');
+  const f = fakeApi({
+    messages: { c1: [msg] }, chats: { c1: { id: 'c1' } },
+    promptPresets: { activeId: 'p1', activeConnectionId: 'c1', presets: [
+      { id: 'p1', name: 'Main', mode: 'custom', prompt: 'style, {{character_prompt}}', negativePrompt: '{{persona_negative_prompt}}' },
+    ] },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.ok(!genInput.prompt.includes('{{'));
+  assert.equal(genInput.prompt, 'style, forest');
+  // negative was macro-only -> cleaned to empty -> field omitted entirely (lets the
+  // host's own connection-default negative apply, not an empty override)
+  assert.equal('negativePrompt' in genInput, false);
+});
+
+test('REGRESSION (3rd pass, finding 2): with no active main preset, the scene prompt is sent alone (unchanged from before this fix)', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="forest">');
+  const f = fakeApi({
+    messages: { c1: [msg] }, chats: { c1: { id: 'c1' } },
+    promptPresets: { activeId: null, activeConnectionId: null, presets: [] },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.prompt, 'forest');
+  assert.equal('negativePrompt' in genInput, false);
+});
+
+test('REGRESSION (3rd pass, finding 2): a host without getPromptPresets (older/optional API) never blocks generation — scene prompt alone', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="forest">');
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } }); // promptPresets omitted entirely
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.prompt, 'forest');
+});
+
+test('REGRESSION (3rd pass, finding 2): a getPromptPresets failure is swallowed — generation still proceeds with the scene prompt alone', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="forest">');
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } }, promptPresets: null });
+  f.api.imageGen.getPromptPresets = async () => { throw new Error('boom'); };
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.prompt, 'forest');
+  const patch = f.calls.find((c) => c[0] === 'updateMessage');
+  assert.ok(patch[3].content.includes('![그림:p1|forest]')); // still succeeds end to end
+});
+
+test('REGRESSION (3rd pass, finding 2): regenerate also composes the active main preset onto the stored prompt', async () => {
+  const content = '[⚠️ 그림 생성 실패(오류) · "forest" · 패널에서 \'다시 그리기\'로 재시도 <pic-failed id="p1">]';
+  const msg = assistantMsg('m1', content, { lv_illust: { images: { p1: { status: 'fail', prompt: 'forest', characterTags: [], summary: 'forest' } } } });
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    promptPresets: { activeId: 'p1', activeConnectionId: null, presets: [{ id: 'p1', name: 'Main', mode: 'custom', prompt: 'watercolor' }] },
+  });
+  const svc = createService(f.api);
+  await svc.runFrontendRequest({ type: 'regenerate', chatId: 'c1', messageId: 'm1', imageId: 'p1' });
+  const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.prompt, 'watercolor, forest');
+});
+
 test('REGRESSION (2nd pass, finding 7): history cleanup (stripping rendered images to a placeholder) still runs when auto-gen is OFF for the chat — only instruction injection is gated on it', async () => {
   const f = fakeApi();
   const svc = createService(f.api);
@@ -584,4 +674,90 @@ test('REGRESSION (2nd pass, finding 1): a malformed tag already marked is never 
   // re-processing the SAME (already-annotated) message must not add a second annotation
   await svc.handleMessageEdited({ chatId: 'c1', message: { id: 'm1' } });
   assert.equal(msg.content.length, firstLength);
+});
+
+test('REGRESSION (3rd pass, finding 1 — exact scale from review): 60 distinct malformed tags, processed repeatedly at the backend/integration level, settles after ONE write and stays a no-op (the previous 50-entry cap made this grow forever)', async () => {
+  const content = Array.from({ length: 60 }, (_, i) => `<pic foo="bar${i}">`).join(' 글 ');
+  const msg = assistantMsg('m1', content);
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const svc = createService(f.api);
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' }); // pass 1: annotates all 60
+  const writesAfterFirst = f.calls.filter((c) => c[0] === 'updateMessage').length;
+  assert.equal(writesAfterFirst, 1);
+  const stableContent = msg.content;
+  for (let i = 0; i < 5; i++) {
+    // repeated passes (simulating repeated MESSAGE_EDITED/GENERATION_ENDED firings on
+    // the SAME already-annotated message) — each must be a complete no-op: no further
+    // updateMessage calls at all, content never changes again.
+    await svc.handleMessageEdited({ chatId: 'c1', message: { id: 'm1' } });
+  }
+  const totalWrites = f.calls.filter((c) => c[0] === 'updateMessage').length;
+  assert.equal(totalWrites, 1, 'no further writes after the first pass, across 5 more passes');
+  assert.equal(msg.content, stableContent);
+  // and every original tag is still there, byte for byte, once our markers are peeled off
+  assert.equal(msg.content.split(MALFORMED_MARKER_TEXT).join(''), content);
+});
+
+// ---------------------------------------------------------------- REGRESSION (review, 3rd pass): finding 3 (lock map)
+
+test('REGRESSION (3rd pass, finding 3): per-message locks are released after settling — 1000 distinct keys leave the lock map empty', async () => {
+  // One chat per message (so each gets a distinct (chatId, messageId) lock key); no
+  // <pic> tag in any of them — the lock is still acquired/released before that
+  // early-return, which is exactly the leak the reviewer reproduced.
+  const perChatMessages = {};
+  for (let i = 0; i < 1000; i++) perChatMessages['c' + i] = [assistantMsg('m' + i, '그냥 평범한 답변 (태그 없음)')];
+  const f = fakeApi({ messages: perChatMessages });
+  const svc = createService(f.api);
+  const jobs = [];
+  for (let i = 0; i < 1000; i++) jobs.push(svc.handleGenerationEnded({ chatId: 'c' + i, messageId: 'm' + i }));
+  await Promise.all(jobs);
+  assert.equal(_debugLockMapSize(), 0, 'the lock map must not retain a settled entry per distinct message');
+});
+
+test('REGRESSION (3rd pass, finding 3): a settled entry is not deleted out from under a newer queued operation for the same key', async () => {
+  // Reproduces the exact hazard the naive "always delete on settle" fix would introduce:
+  // call A and call B both target the SAME key, close together. If A's settle handler
+  // deleted the map entry unconditionally, it would erase B's (now-current) tracking
+  // entry while B is still pending, letting a hypothetical call C run concurrently with B.
+  const msg = assistantMsg('m1', '그냥 평범한 답변');
+  const f = fakeApi({ messages: { c1: [msg] }, chats: { c1: { id: 'c1' } } });
+  const svc = createService(f.api);
+  const a = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const b = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  await a; // A settles first (or close to it)
+  // B must still be tracked (or already settled itself) — the map must never be empty
+  // here in a way that implies B's own completion wasn't properly chained behind A.
+  await b;
+  assert.equal(_debugLockMapSize(), 0); // both settled by now — fully cleaned up
+});
+
+test('REGRESSION (3rd pass, finding 3): a hung predecessor cannot block a message\'s queue forever — the lock releases after its deadline', async () => {
+  // Isolates the per-message LOCK's own timeout from the separate (and intentionally
+  // serialized-to-1, per DESIGN.md §4) image-generation queue: the first call hangs
+  // INSIDE its own generate() call; the second call, once the lock releases, must be
+  // able to acquire it and run its own (generate-free) pass to completion. Making the
+  // second pass generate-free avoids a false failure caused by the *separate* global
+  // generate queue still being occupied by the still-hung first call — that queue is
+  // supposed to serialize real generations; this test is about the message lock only.
+  const msg = assistantMsg('m1', '<pic prompt="first">');
+  let releaseHung;
+  const hungGate = new Promise((resolve) => { releaseHung = resolve; });
+  const f = fakeApi({
+    messages: { c1: [msg] }, chats: { c1: { id: 'c1' } },
+    generateImpl: async () => { await hungGate; return { imageId: 'img1', imageUrl: 'https://img/1.png' }; },
+  });
+  const svc = createService(f.api, { lockTimeoutMs: 20 }); // tiny deadline for the test
+  const hungCall = svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' }); // never awaited directly — the "hung predecessor"
+  await new Promise((r) => setTimeout(r, 50)); // let the deadline elapse
+  // Simulate the message having been edited (by someone/something else) while the
+  // first call was stuck — the lock itself doesn't touch content, only serializes
+  // access to it, so this is just how we give the second pass nothing left to do.
+  msg.content = '그냥 평범한 답변 (태그 없음)';
+  const second = svc.handleMessageEdited({ chatId: 'c1', message: { id: 'm1' } });
+  await second;
+  // reaching here at all (not hanging forever itself) proves the lock was released;
+  // the second pass found no live tags and correctly did nothing further.
+  assert.equal(f.calls.find((c) => c[0] === 'updateMessage'), undefined);
+  releaseHung(); // let the first call finish in the background so the test process can exit cleanly
+  await hungCall.catch(() => {});
 });

@@ -5,7 +5,13 @@ TypeScript source (not from any AutoPic/SillyGgu code — clean room). Paths are
 the `lumiverse` container as of this writing (image built 2026‑10‑10 per file mtimes).
 
 - Spindle types: `/home/bun/.bun/install/cache/lumiverse-spindle-types@0.6.32@@@1/dist/*.d.ts`
-- Host source: `/app/src/spindle/*.ts`, `/app/src/image-gen/providers/novelai.ts`
+  for the first-pass rounds; later rounds (where noted) read the container's actual
+  *installed* copy at `/app/node_modules/lumiverse-spindle-types` (**0.6.40** — newer;
+  a couple of methods used in later rounds, e.g. `imageGen.getPromptPresets`, are only
+  declared there, not in the older cached copy). `.review/host/spindle-types/` holds the
+  0.6.40 copy.
+- Host source: `/app/src/spindle/*.ts`, `/app/src/image-gen/providers/novelai.ts`,
+  `/app/src/services/image-gen.service.ts`
 - User docs: `/app/user-docs/docs/extensions/index.md`
 
 Confidence key: **VERIFIED** = read directly in the files above. **INFERRED** = a
@@ -98,6 +104,83 @@ author — re-interpreting it would be redundant and could drift from what was a
 not inferred from type signatures alone. **Not independently re-verified against a live
 generation** — the composed-prompt behavior (style preset text actually prepended) has
 not been visually confirmed on a real server; see "Known limitations".
+
+**Follow-up (3rd review pass): the above restored the LoRA/style preset but not the
+*main* prompt preset.** `generateNative()`'s own prompt resolution
+(`resolvePromptInput`, `image-gen.service.ts:1319-1327`) does:
+
+```ts
+let prompt = opts?.prompt ?? preset?.prompt ?? settings.customPrompt ?? "";
+```
+
+Our `opts.prompt` (the tag's scene text) is never `null`/`undefined`, so it always wins
+this `??` chain — the active main preset's own `prompt` text is **silently dropped
+entirely**, not composed, regardless of `skipParse`. (`skipParse:true` additionally
+skips `expandCharacterPromptMacro` at `:1336-1344`, which is the step that would
+otherwise substitute `{{character_prompt}}`/`{{persona_prompt}}` and their `_negative_`
+counterparts with a bound character/persona preset's text — irrelevant to us either way
+since we never forward the raw preset text containing those tokens.)
+
+Fixed by composing explicitly ourselves, using a *separate*, previously-uninvestigated
+spindle API:
+
+- `spindle.imageGen.getPromptPresets(userId?)` — worker-side definition
+  `worker-runtime.ts:2430-2432` (`request({type:"image_gen_prompt_presets", ...})`);
+  host dispatch `worker-host.ts:2539-2540`
+  (`case "image_gen_prompt_presets": this.imageGenApi.handlePromptPresets(...)`); handler
+  `worker-host-image-gen-api.ts:340-349` — gated by `this.requirePermission()`, the
+  same `image_gen`-only check as every other image-gen call (verified, not a new
+  permission); delegates to `image-gen.service.ts:343-349`
+  `getMainImagePromptPresets(userId)`, which returns
+  `{ activeId, activeConnectionId, presets }` filtered to
+  `!preset.kind || preset.kind === "main"` (i.e. **excludes** character/persona/
+  captioning presets — exactly the "main" preset DESIGN.md means). **VERIFIED by
+  reading the full call chain**, worker-side signature through host implementation.
+  — **Type-definition note:** this method (and its `ImageGenPromptPresetDTO`/
+  `ImageGenPromptPresetsResultDTO` types) is absent from the
+  `lumiverse-spindle-types@0.6.32` package cached under the Bun install cache (the copy
+  originally read for earlier rounds); the container's actual installed package at
+  `/app/node_modules/lumiverse-spindle-types` is **0.6.40**, which does declare it
+  (`spindle-api.d.ts:707`: `getPromptPresets?(userId?: string): Promise<...>` — marked
+  **optional**, hence `backend.mjs`'s `typeof api.imageGen.getPromptPresets !== 'function'`
+  feature-detection before calling it). `.review/host/spindle-types/` has been
+  refreshed to the 0.6.40 copy. This is a packaging/cache discrepancy on the host's
+  side, not a version actually served differently to extensions — `worker-runtime.ts`
+  (what's actually running) is the same single running instance that defines
+  `spindle.imageGen` either way.
+- Macro tokens: confirmed exact names/regex via `substituteCharacterPromptMacro`
+  (`image-gen.service.ts:1380-1392`, `/\{\{\s*character_(?:negative_)?prompt\s*\}\}/gi`
+  — pattern reconstructed from the two literal regexes shown) and
+  `substitutePersonaPromptMacro` (`:1402-1412`, same shape for `persona_*`).
+
+**Composition implemented in `core.mjs`:**
+`stripCharacterPersonaMacros()` removes all four tokens (our own registry/characterTags
+already supplies per-character appearance — splicing in a bound character/persona
+preset snippet too would duplicate it, so tokens are *dropped*, not expanded);
+`joinPromptParts()` joins non-empty, comma-trimmed fragments; `buildFinalPrompt()`
+composes `[cleaned preset positive, scene prompt]` for the final `prompt`, and returns
+the cleaned preset negative only when non-empty (`backend.mjs` then conditionally
+includes `negativePrompt` in the request at all) — when there's nothing to contribute,
+the field is **omitted entirely** rather than sent as `""`, specifically so
+`resolvePromptInput`'s own `opts?.negativePrompt ?? preset?.negativePrompt ?? ...`
+fallback chain (same file, same line as the positive prompt) still applies the
+connection's own default negative prompt exactly as it did before any of this — sending
+an explicit `""` would have short-circuited that `??` chain and silently dropped the
+connection default instead (verified by reading the same `??` chain; this is also why a
+non-empty preset negative is sent explicitly rather than relying on the host's
+`preset?.negativePrompt` fallback: that fallback path still goes through
+`expandCharacterPromptMacro`-skipped territory under our `skipParse:true`, so it would
+leave `{{character_negative_prompt}}`-style tokens unstripped — we only trust our own
+pre-cleaned text).
+
+`backend.mjs`'s `fetchMainPreset()` fetches the preset **once per message-processing
+pass** (not once per tag — the active preset can't change mid-pass) and once per
+`regenerate` call; any failure (missing method, thrown error, malformed shape) is
+swallowed and treated as "no preset" — generation is never blocked by this lookup.
+**Confidence: VERIFIED by direct source read** of every cited line above. **Not
+independently verified against a live generation** — whether the composed prompt
+visibly changes a real generated image has not been confirmed on a live server (same
+caveat as the LoRA/style preset finding above).
 
 ## Chat mutation
 
@@ -213,14 +296,25 @@ not been visually confirmed on a real server; see "Known limitations".
   important thing to check in the "first task before building" sense that DESIGN.md §6
   asked for, and it could not be fully closed from source alone — it needs one real
   generation with a `<pic>` tag to see what actually renders.**
-- **UNVERIFIED: `generateNative`'s native style/LoRA preset composition, in practice.**
-  The *code path* that composes the user's active native preset's `base_tags` onto the
-  prompt is verified by direct source read (see the `generate()` vs `generateNative()`
-  section above, with file:line citations) — but whether that preset text actually shows
-  up, visibly, in a real generated image has not been confirmed on a live server. If the
-  user has no active native preset configured, this is a no-op either way (`base_tags`
-  composition is skipped when `activePreset` is null); if they do have one, it should
+- **UNVERIFIED: preset composition (LoRA/style base_tags AND the main prompt preset),
+  in practice.** Both code paths — `generateNative`'s automatic LoRA/style `base_tags`
+  composition, and this extension's own explicit main-preset-prompt composition
+  (`buildFinalPrompt`, fed by `spindle.imageGen.getPromptPresets`) — are verified by
+  direct source read (see the `generate()` vs `generateNative()` section above, with
+  file:line citations for both), but whether the composed text actually shows up,
+  visibly, in a real generated image has not been confirmed on a live server. If the
+  user has no active preset of either kind configured, composition is a no-op either
+  way (falls back to the scene prompt alone, by design); if they do have one, it should
   apply, but this needs one real generation to see confirmed.
+- **Accepted residual risk: the per-message lock's timeout cannot cancel a hung
+  operation, only stop waiting for it.** If an operation (e.g. a stuck `generateNative`
+  RPC with no timeout of its own) hangs past `lockTimeoutMs` (default 3 minutes), the
+  lock releases so later operations for the same message aren't blocked forever — but
+  the hung operation keeps running in the background with no cancellation signal wired
+  through arbitrary host RPCs. If it eventually completes and was far enough along to
+  reach its own `chat.updateMessage` call, that write could still land, uncoordinated
+  with whatever ran after the timeout. Not fixed — no cancellation primitive exists to
+  fix it with; logged via `console.error` when it happens so it's at least observable.
 
 ## Independent review (Codex) findings — verified against this code, then fixed
 
@@ -378,6 +472,78 @@ Fixed in `sanitizeAliasForInstruction` (strip `"` along with control chars). Tes
 `test/core.test.mjs` "REGRESSION (review bonus)".
 
 No findings were rejected in this pass either — 7/7 confirmed real, fixed, regression-tested.
+
+## Third independent review (Codex, with host sources available) — verified, then fixed
+
+A fourth review pass re-tested the round-2 fixes with real reproductions (not just code
+reading) and found that finding 1 (malformed-tag handling) was still incompletely fixed,
+plus one new major finding (preset composition, partial from round 2) and one new minor
+(lock map cleanup). **No BLOCKER was reproduced this round** — the reviewer explicitly
+confirmed the stale-write race, duplicate-id, missing-URL, orphan-button, and
+auto-off/cleanup fixes from round 2 all held up under new reproductions. 2 MAJOR + 1
+MINOR found; all 3 confirmed real against the actual code, none rejected.
+
+1. **MAJOR (round-2 fix incomplete) — malformed-tag annotations could grow without
+   bound.** Confirmed and reproduced exactly as described: a capped `malformedSeen`
+   metadata list (`.slice(-50)`) evicted old entries while the physical annotation
+   stayed in the message forever — past 50 distinct malformed tags, every later pass
+   rediscovered an evicted-from-the-list (but still-unmarked-as-seen) tag and annotated
+   it again, producing unbounded growth (reviewer measured 110 writes / 160 annotations
+   over 110 passes at 51 distinct tags). A second variant showed the inserted
+   annotation itself becoming part of the next parse's `tag.raw` for an unterminated
+   tag, shifting the dedup key and causing nested annotations. **Root-caused and fixed
+   properly this time**: idempotency is now a property of the *content itself*, not a
+   side list with a cap to desync from reality. `parseTags`'s `checkAnnotated()` checks
+   whether the exact fixed marker text (`MALFORMED_MARKER_TEXT`) is found immediately
+   after a malformed span; if so, the tag is flagged `annotated: true` and `planMessage`
+   skips it entirely (no new marker, nothing recorded anywhere) — correct regardless of
+   how many malformed tags exist or how many passes run, because there is no cap to hit.
+   The `malformedSeen` metadata field and its `MAX_SEEN_MALFORMED` cap were removed
+   entirely, not just enlarged. Property-tested with `N=20` repeated passes over three
+   scenarios (60 distinct malformed tags; an unterminated tag + long prose; a mix of
+   valid/malformed) in `test/core.test.mjs`, asserting only the first pass writes
+   anything and original text is always byte-for-byte recoverable; an integration-level
+   test in `test/backend.test.mjs` reproduces the reviewer's exact 60-tag scale through
+   `handleGenerationEnded`/`handleMessageEdited`.
+2. **MAJOR (round-2 "generateNative" fix was incomplete) — the native main prompt
+   preset was still only partially applied.** Confirmed by reading
+   `image-gen.service.ts:1333` directly: `opts?.prompt ?? preset?.prompt ?? ...` means
+   our inline scene prompt (never `null`/`undefined`) always wins — the active main
+   preset's own prompt text was silently dropped, not composed, even after switching to
+   `generateNative()`. Only the *separate* LoRA/style preset (round 2) was actually
+   fixed; the main positive-prompt preset mechanism is a different code path entirely.
+   Investigated and fixed as described in detail in the `generate()` vs
+   `generateNative()` section above ("Follow-up (3rd review pass)") — composes the
+   active main preset's cleaned prompt with the tag's scene prompt explicitly via
+   `spindle.imageGen.getPromptPresets()`, with macro tokens stripped (not expanded) and
+   the negative prompt handled to avoid doubling with the connection default. Six new
+   regression tests in `test/backend.test.mjs` cover: composition happens, macro tokens
+   are stripped, no-preset falls back to scene-alone, a host without the optional method
+   never blocks generation, a thrown error from the method is swallowed, and regenerate
+   also composes the preset.
+3. **MINOR, confirmed real.** The per-message lock map (`messageLocks`) never deleted a
+   settled entry — reproduced: processing 1,000 distinct `(chatId, messageId)` keys left
+   1,000 permanent entries, including messages with no `<pic>` tags at all (the lock is
+   acquired before that check). Fixed: a settled entry is deleted, but **only if it is
+   still that key's most-recently-queued entry** — deleting unconditionally would let a
+   second call's own entry (queued behind the first, for the same key) get erased by the
+   first call's cleanup, which would let a third call bypass the queue entirely. Also
+   added, per the coordinator's explicit request alongside this finding: a fixed overall
+   deadline per operation (default 3 minutes, overridable via `createService(api,
+   {lockTimeoutMs})` for tests), so a hung predecessor (e.g. a stuck host RPC with no
+   timeout of its own) cannot block every later operation queued for the same message
+   forever — on timeout the lock is released (logged via `console.error`) for the next
+   queued operation. This does **not** cancel the hung operation itself (no cancellation
+   primitive is plumbed through arbitrary host RPCs); if it completes later anyway, its
+   result is discarded, but if it was about to write, that write could still land,
+   uncoordinated with whatever ran after it timed out. This residual risk is accepted
+   and documented, not silently assumed away — see "Known limitations". Tests: 1,000-key
+   memory test, a same-key-queued-behind-a-settling-call test, and a real (short,
+   `lockTimeoutMs: 20`) timeout test proving a second operation can proceed once the
+   first's deadline elapses.
+
+No findings were rejected in this pass either — all 3 confirmed real, fixed,
+regression-tested. 124 tests total (was 103), all passing.
 
 ## What was explicitly NOT done (by design, not oversight)
 

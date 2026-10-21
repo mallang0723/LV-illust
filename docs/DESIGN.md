@@ -73,21 +73,34 @@
 ```
 GENERATION_ENDED (assistant 메시지)
   → 메시지 본문에서 <pic …> 찾기 (없으면 끝)
+  → (chatId, messageId)별로 직렬화(잠금) — 같은 메시지를 겹쳐 건드리는 일이 없게
   → 태그마다:
        chars 파싱 → 등록부에서 이름 매칭 → characterTags = [{tags: 외형 + 동작}, …]
-       prompt = 메인 프롬프트(루미버스 프리셋 또는 확장 설정) + 태그 prompt
-       spindle.imageGen.generate({ prompt, negativePrompt, parameters:{ characterTags },
-                                   owner_chat_id, owner_character_id, includeDataUrl:false })
-       → imageUrl 받기
+       루미버스의 활성 메인 이미지 프롬프트 프리셋을 조회(spindle.imageGen.getPromptPresets) —
+         있으면 그 긍정 프롬프트(단, {{character_prompt}}/{{persona_prompt}}류 매크로는
+         제거 — 외형은 이미 characterTags로 넣으므로) + 태그 prompt 를 이어 붙이고,
+         없으면 태그 prompt만 사용. 부정 프롬프트도 프리셋 것(매크로 제거)을 쓰되,
+         비어 있으면 아예 넣지 않아 커넥션 기본 부정 프롬프트가 그대로 적용되게 둔다.
+       spindle.imageGen.generateNative({ chat_id, prompt, promptMode:'custom', skipParse:true,
+                                         parameters:{ characterTags }, negativePrompt?,
+                                         includeDataUrl:false })
+         — generate()가 아니라 generateNative()를 쓰는 이유: 전자는 루미버스 네이티브
+           그림체(LoRA/스타일) 프리셋을 전혀 적용하지 않는다. skipParse로 장면 분석을
+           건너뛰어 우리 characterTags가 덮어써지지 않게 한다.
+       → imageUrl 받기(없으면 실패로 처리 — 호스트가 저장 실패를 삼키고도 성공을 반환할 수 있음)
   → 메시지 본문의 태그를 그림 표시로 교체 (chat.updateMessage)
        원래 태그 정보는 메시지 메타데이터에 보관 (다시 그리기·스와이프용)
+       형식이 깨진 태그는 원문을 건드리지 않고 바로 옆에 짧은 표시만 끼워 넣는다(절대 교체 안 함)
 ```
 
 - 스와이프·재생성: 새 답변 기준으로 다시 처리. 이전 스와이프 그림은 그 스와이프에 남음.
 - 메시지를 수정해서 태그를 새로 쓰면 다시 그림(`MESSAGE_EDITED`).
-- 동시 생성 1개(SharedNAI 한도), 큐로 순서대로.
+- 동시 생성 1개(SharedNAI 한도), 큐로 순서대로. 같은 메시지에 대한 처리 자체도 별도로
+  직렬화하여(겹치는 GENERATION_ENDED/MESSAGE_EDITED가 서로의 기록을 덮어쓰지 않게) 한다.
 - AI 프롬프트에 그림 표시가 그대로 들어가지 않게, 다음 턴부터는 그림 자리를 짧은 표시(`[그림: 장면 요약]`)로
-  바꿔 보내는 프롬프트 정리 규칙을 같이 둔다.
+  바꿔 보내는 프롬프트 정리 규칙을 같이 둔다(자동 생성이 꺼져 있어도 이 정리는 항상 적용).
+
+정확한 근거(파일:줄, 호스트 소스 직접 확인 결과)는 `docs/API-NOTES.md`를 참고.
 
 ## 5. 저장 위치
 
@@ -101,7 +114,8 @@ GENERATION_ENDED (assistant 메시지)
 
 | 필요한 것 | API | 상태 |
 |---|---|---|
-| 그림 생성 | `spindle.imageGen.generate` (ImageGenRequestDTO) | 타입 정의 확인 |
+| 그림 생성 | `spindle.imageGen.generateNative` (ImageGenNativeRequestDTO, `promptMode:'custom'`) | 호스트 소스(`image-gen.service.ts`) 직접 확인 — `generate()`는 네이티브 그림체 프리셋을 적용하지 않아 채택하지 않음 |
+| 메인 프롬프트 프리셋 조회 | `spindle.imageGen.getPromptPresets` (선택적 메서드, 없으면 장면 prompt만 사용) | 호스트 소스 직접 확인(`getMainImagePromptPresets`), `image_gen` 권한만 필요 |
 | NAI 인물별 칸 | `parameters.characterTags: [{tags}]` → `characterPrompts`·`v4_prompt.char_captions` | 루미버스 NovelAI 공급자 코드·테스트 확인. 위치 지정(center)은 고정 0,0 |
 | 생성 끝 이벤트 | `GENERATION_ENDED` | 타입 정의 확인 |
 | 메시지 고치기 | `spindle.chat.updateMessage` | 타입 정의 확인, 실제 동작 미시험 |

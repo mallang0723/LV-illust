@@ -46,13 +46,29 @@ function scanTag(text, openIdx) {
   }
 }
 
+// Review (3rd pass) finding 1: idempotency for malformed tags must come from the
+// CONTENT itself, not a side list (a capped metadata list evicts old entries while the
+// physical annotation stays in the message forever, causing endless re-annotation once
+// the distinct-malformed-tag count exceeds the cap — reproduced at 51 distinct tags /
+// 110 passes). Content-based check: if our fixed marker text is found immediately
+// after a malformed span, that occurrence has already been annotated — skip it
+// entirely (no new marker, `end` advances past the existing marker so it's never
+// re-included in a later span). No list, no cap, correct regardless of how many
+// malformed tags exist or how many passes run.
+function checkAnnotated(text, end) {
+  if (text.startsWith(MALFORMED_MARKER_TEXT, end)) {
+    return { annotated: true, end: end + MALFORMED_MARKER_TEXT.length };
+  }
+  return { annotated: false, end };
+}
+
 /**
  * Find every `<pic ...>` occurrence in `content` (well-formed tags, parsed; malformed
  * ones flagged) in document order, non-overlapping. Already-rendered markers
- * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`, `[그림 태그 형식 오류 ...]`)
- * never match (nothing there starts with `<pic` followed by whitespace/`>` — `pic-failed`
- * fails the boundary check), so re-running this on an already-processed message is a
- * no-op — satisfies "never re-process already-rendered images".
+ * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`, and an already-annotated
+ * malformed tag's marker) never start a new match of their own (nothing there starts
+ * with `<pic` followed by whitespace/`>`), so re-running this on an already-processed
+ * message is a no-op — satisfies "never re-process already-rendered images".
  */
 export function parseTags(content) {
   const text = String(content ?? '');
@@ -72,41 +88,43 @@ export function parseTags(content) {
       const { attrs } = scanned;
       const hasChars = Object.prototype.hasOwnProperty.call(attrs, 'chars');
       const hasPrompt = Object.prototype.hasOwnProperty.call(attrs, 'prompt');
+      const malformed = !hasChars && !hasPrompt;
+      const raw = text.slice(idx, scanned.end);
+      const { annotated, end } = malformed ? checkAnnotated(text, scanned.end) : { annotated: false, end: scanned.end };
       out.push({
-        start: idx,
-        end: scanned.end,
-        raw: text.slice(idx, scanned.end),
-        malformed: !hasChars && !hasPrompt,
+        start: idx, end, raw, malformed, annotated,
         charsRaw: hasChars ? attrs.chars : '',
         promptRaw: hasPrompt ? attrs.prompt : '',
       });
-      searchFrom = scanned.end;
+      searchFrom = end;
     } else {
       // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
       //
-      // This span is now ONLY used to (a) find a short, stable key for "have we already
-      // flagged this exact broken tag" and (b) decide where to resume scanning for more
-      // `<pic` occurrences — it is NEVER used to delete/replace anything any more (see
+      // This span is now ONLY used to (a) decide where to insert an annotation / detect
+      // an existing one and (b) decide where to resume scanning for more `<pic`
+      // occurrences — it is NEVER used to delete/replace anything (see
       // planMessage/renderMalformedMarker: malformed handling only ever INSERTS a short
       // marker after the untouched original text, never replaces it). Still bounded to
       // a small span regardless of which branch is taken — review (2nd pass) finding 1
       // caught that the `nextLt` fallback below had NO bound at all, so a broken tag
       // followed by a long stretch of real narrative and then any later '<' (even a
-      // genuine later tag far down the message) made `tag.raw` (and therefore the
-      // dedup key) swallow all of that narrative. Capping every branch at BOUND avoids
-      // that regardless of what used to (and no longer does) happen to the swallowed text.
+      // genuine later tag far down the message) made `tag.raw` swallow all of that
+      // narrative. Capping every branch at BOUND avoids that regardless of what used to
+      // (and no longer does) happen to the swallowed text.
       const BOUND = 300;
       const nextLt = text.indexOf('<', idx + 4);
       const nextGt = text.indexOf('>', idx + 4);
-      let end;
+      let rawEnd;
       if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
-        end = nextGt + 1; // include the stray '>' — the broken tag's apparent close
+        rawEnd = nextGt + 1; // include the stray '>' — the broken tag's apparent close
       } else if (nextLt !== -1 && nextLt - idx <= BOUND) {
-        end = nextLt; // stop before whatever starts next (often a later real tag)
+        rawEnd = nextLt; // stop before whatever starts next (often a later real tag)
       } else {
-        end = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
+        rawEnd = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
       }
-      out.push({ start: idx, end, raw: text.slice(idx, end), malformed: true, charsRaw: '', promptRaw: '' });
+      const raw = text.slice(idx, rawEnd);
+      const { annotated, end } = checkAnnotated(text, rawEnd);
+      out.push({ start: idx, end, raw, malformed: true, annotated, charsRaw: '', promptRaw: '' });
       searchFrom = end;
     }
   }
@@ -223,6 +241,66 @@ export function assemblePrompt(basePrompt, extraFragments) {
   return [base, extra].filter(Boolean).join(', ');
 }
 
+// ---------------------------------------------------------------- main preset composition (F5, review finding 2 round 3)
+
+// Lumiverse's `{{character_prompt}}`/`{{character_negative_prompt}}` and
+// `{{persona_prompt}}`/`{{persona_negative_prompt}}` macros splice in a card-bound (or
+// persona-bound) preset snippet — but that substitution only happens when the host's
+// OWN prompt-resolution path runs (`image-gen.service.ts` `expandCharacterPromptMacro`),
+// which we deliberately bypass via `skipParse:true` (so our already-exact scene prompt
+// isn't re-parsed). If we naively concatenated the active main preset's text as-is, any
+// of these four tokens in it would reach the provider as literal `{{...}}` text instead
+// of being expanded or removed. Since our own per-character registry (F3) already
+// supplies appearance text via `characterTags`, the correct behavior is to drop these
+// tokens entirely rather than try to expand them ourselves — stripped, not substituted.
+// Token names/regex verified against `image-gen.service.ts` `substituteCharacterPromptMacro`
+// (~1380-1392) and `substitutePersonaPromptMacro` (~1402-1412): case-insensitive,
+// tolerant of internal whitespace.
+const CHAR_PERSONA_MACRO_RE = /\{\{\s*(?:character|persona)_(?:negative_)?prompt\s*\}\}/gi;
+export function stripCharacterPersonaMacros(text) {
+  return String(text ?? '').replace(CHAR_PERSONA_MACRO_RE, '');
+}
+
+/** Joins non-empty prompt fragments with ", ", trimming each fragment's own leading/
+ *  trailing commas and whitespace first so stripping a macro token (which can leave
+ *  "a, , b" or ", b" behind) never produces a doubled or stray leading separator. */
+export function joinPromptParts(parts) {
+  return (parts || [])
+    .map((p) => String(p ?? '').trim())
+    .map((p) => p.replace(/^[,\s]+|[,\s]+$/g, ''))
+    .filter(Boolean)
+    .join(', ');
+}
+
+/**
+ * Compose the final request prompt/negativePrompt from the tag's scene prompt and the
+ * user's active native main image-prompt preset (if any) — review (3rd pass) finding 2:
+ * `imageGen.generateNative()` with an inline `prompt` REPLACES the active preset's own
+ * prompt rather than composing with it (`image-gen.service.ts:1333`: `opts?.prompt ??
+ * preset?.prompt ?? ...` — our prompt always wins the `??` chain since it's never
+ * null/undefined), so the DESIGN.md §4 "main prompt + tag prompt" contract has to be
+ * assembled explicitly here instead of relying on the host to do it.
+ *
+ * `mainPreset` is `{ prompt, negativePrompt } | null` — the active preset fetched via
+ * `spindle.imageGen.getPromptPresets()` (see backend.mjs `fetchMainPreset`), or `null`
+ * if there is none / it couldn't be fetched (scene prompt alone, unchanged from before
+ * this fix — never blocks generation).
+ *
+ * Negative prompt: when the cleaned preset negative is non-empty, it's returned
+ * explicitly (single source — never combined with the connection's own default
+ * negative, avoiding a doubled-up negative prompt). When there's nothing to contribute
+ * (no preset, or an empty/macro-only negative), `negativePrompt` is `undefined` so the
+ * caller can omit the field entirely and let the host's own connection-default
+ * fallback apply exactly as it did before this fix.
+ */
+export function buildFinalPrompt(scenePrompt, mainPreset) {
+  const presetPositive = mainPreset?.prompt ? stripCharacterPersonaMacros(mainPreset.prompt) : '';
+  const prompt = joinPromptParts([presetPositive, scenePrompt]);
+  const rawNegative = mainPreset?.negativePrompt ? stripCharacterPersonaMacros(mainPreset.negativePrompt) : '';
+  const cleanedNegative = joinPromptParts([rawNegative]); // same leading/trailing-comma cleanup as the positive side
+  return { prompt, negativePrompt: cleanedNegative || undefined };
+}
+
 // ---------------------------------------------------------------- markers (F2/F5)
 
 export function summarize(text, max = 40) {
@@ -318,25 +396,24 @@ export function renderMalformedMarker() {
  *    need generation (malformed -> malformed marker, overflow valid tags -> skipped
  *    marker). Tags in `jobs` get their marker filled in later from the generation result.
  */
-export function planMessage(content, { registry = [], maxImages = 2, existingImageIds = [], seenMalformed, idGenerator } = {}) {
+export function planMessage(content, { registry = [], maxImages = 2, existingImageIds = [], idGenerator } = {}) {
   const tags = parseTags(content);
   const jobs = [];
   const skipped = [];
-  const newlyMalformed = [];
   // markers: tagIndex -> { mode: 'replace' | 'insert', text }. 'replace' swaps the
   // original tag text out (success/failure/skip — the whole point of F5). 'insert'
   // (malformed tags only, review finding 1) keeps the original text and only ADDS a
   // short marker right after it, so malformed handling can never shrink the message.
   const markers = new Map();
-  const seen = seenMalformed instanceof Set ? seenMalformed : new Set();
   const usedIds = existingImageIds.slice();
   let validCount = 0;
   tags.forEach((tag, i) => {
     if (tag.malformed) {
-      if (!seen.has(tag.raw)) {
-        markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
-        newlyMalformed.push({ tagIndex: i, raw: tag.raw });
-      }
+      // Review (3rd pass) finding 1: idempotency is now a property of `tag.annotated`
+      // (content-based, computed by parseTags itself — see checkAnnotated) rather than
+      // a side list here, so there is nothing to cap and nothing that can drift out of
+      // sync with what's actually in the message.
+      if (!tag.annotated) markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
       return;
     }
     validCount++;
@@ -352,7 +429,7 @@ export function planMessage(content, { registry = [], maxImages = 2, existingIma
     }
     jobs.push({ tagIndex: i, id, prompt, characterTags, summary: tag.promptRaw });
   });
-  return { tags, jobs, skipped, markers, newlyMalformed };
+  return { tags, jobs, skipped, markers };
 }
 
 /** Splice `content` using parseTags-produced `tags` and a parallel marker map

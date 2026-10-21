@@ -13,14 +13,13 @@
 import {
   normalizeSettings, normalizeRegistry, planMessage,
   renderSuccessMarker, renderFailureMarker, stripRenderedImages, hasLiveTags,
-  injectInstruction, markerRegexForId, IDENTIFIER,
+  injectInstruction, markerRegexForId, buildFinalPrompt, IDENTIFIER,
 } from './core.mjs';
 
 const SETTINGS_PATH = 'settings.json';
 const AUTO_VAR_KEY = 'lv_illust.auto';
 const ORPHAN_VAR_KEY = 'lv_illust.orphans';
 const MAX_ORPHANS = 20;
-const MAX_SEEN_MALFORMED = 50;
 
 function extToRegistry(character) {
   return normalizeRegistry(character?.extensions?.[IDENTIFIER]);
@@ -125,11 +124,44 @@ function queuedCall(fn) {
  *     and the chosen-path rationale.
  * Still only requires the `image_gen` permission (`worker-host-image-gen-api.ts:107-110`,
  * same gate as `generate()` — `requirePermission()` checks only `"image_gen"`).
+ *
+ * Review (3rd pass) finding 2: the above only restored the LoRA/style preset. The
+ * user's active native MAIN prompt preset is still not applied by `generateNative()`
+ * itself — `resolvePromptInput` (`image-gen.service.ts:1333`) resolves
+ * `opts?.prompt ?? preset?.prompt ?? ...`, so our inline `prompt` (never null/undefined)
+ * always wins and the preset's own prompt text is silently dropped entirely, not
+ * composed. `skipParse:true` also skips `expandCharacterPromptMacro` (`:1336-1344`), so
+ * even if we did forward the preset text as-is, any `{{character_prompt}}` /
+ * `{{persona_prompt}}` tokens in it would reach the provider as literal text. Fixed:
+ * `fetchMainPreset()` reads the user's active main preset via
+ * `spindle.imageGen.getPromptPresets()` (gated by the same `image_gen` permission,
+ * `worker-host-image-gen-api.ts:340-349` → `image-gen.service.ts:343-349`
+ * `getMainImagePromptPresets`, filtered to `kind:'main'`/legacy-no-kind presets only);
+ * `core.mjs`'s `buildFinalPrompt()` then explicitly composes `preset.prompt + scene
+ * prompt` (macro tokens stripped, not expanded — our own registry/characterTags already
+ * supply per-character appearance, so splicing in a bound character/persona snippet
+ * too would duplicate it) and supplies the preset's own (cleaned) negative prompt only
+ * when non-empty, to avoid doubling with the connection's own default negative. See
+ * docs/API-NOTES.md for the full citation and composition rationale.
  */
-async function generateImage(api, { chatId, prompt, characterTags }) {
+async function fetchMainPreset(api) {
+  if (typeof api.imageGen.getPromptPresets !== 'function') return null; // optional on older hosts
+  try {
+    const result = await api.imageGen.getPromptPresets();
+    if (!result?.activeId || !Array.isArray(result.presets)) return null;
+    const preset = result.presets.find((p) => p.id === result.activeId);
+    return preset ? { prompt: preset.prompt, negativePrompt: preset.negativePrompt } : null;
+  } catch {
+    return null; // never block generation on this — scene prompt alone, same as before this fix
+  }
+}
+
+async function generateImage(api, { chatId, prompt, characterTags, mainPreset }) {
+  const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset);
   const result = await queuedCall(() => api.imageGen.generateNative({
     chat_id: chatId,
-    prompt,
+    prompt: finalPrompt,
+    ...(negativePrompt !== undefined ? { negativePrompt } : {}),
     promptMode: 'custom',
     skipParse: true,
     parameters: { characterTags },
@@ -187,12 +219,62 @@ async function pushOrphans(api, chatId, entries) {
 // one already committed before it plans anything. (core.mjs's `nextImageId` is also
 // collision-resistant by default now, as defense in depth for the case this in-memory
 // lock can't cover — a worker restart mid-generation.)
+//
+// Review (3rd pass) finding 3: two follow-up problems with the lock map itself.
+//
+// (a) Settled entries were never removed — `messageLocks.set()` had no matching
+// `delete()`, so every distinct (chatId, messageId) ever processed left a permanent
+// entry for the life of the worker, including messages with no `<pic>` tags at all
+// (the lock is acquired before that check). Fixed: once an operation settles, its entry
+// is deleted — but ONLY if it is still that key's current (most recently queued) entry.
+// Deleting unconditionally would be wrong: if a second call already queued behind the
+// first and installed its OWN entry for the same key, deleting on the first call's
+// settlement would erase the SECOND call's tracking, letting a third call bypass the
+// queue entirely and run concurrently with the second (reopening finding 3 round 2).
+//
+// (b) No deadline anywhere in the chain: a predecessor operation that hangs (a stuck
+// RPC with no timeout of its own) blocks every later operation queued for that same
+// message forever. Fixed: every operation is raced against a fixed deadline
+// (`lockTimeoutMs`, default 3 minutes); whichever finishes first is what the NEXT
+// queued operation sees as "done". If the deadline wins, this call's own effect is
+// simply never awaited further (nothing it was about to write has been written yet in
+// the common case, since processMessageInner's one and only write happens after every
+// await it needs completes) and the key is freed for the next queued caller. This does
+// NOT cancel the underlying operation (no cancellation primitive is plumbed through
+// arbitrary host RPCs) — if it eventually completes after its result was already
+// discarded, it could still perform its own write uncoordinated with whatever runs
+// next; this residual risk is called out in docs/API-NOTES.md rather than silently
+// assumed away.
+const DEFAULT_LOCK_TIMEOUT_MS = 3 * 60 * 1000;
 const messageLocks = new Map();
-function withMessageLock(key, fn) {
+
+function raceWithDeadline(fn, key, lockTimeoutMs) {
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      console.error(`[lv_illust] message lock for "${key}" timed out after ${lockTimeoutMs}ms — releasing it for the next queued operation; this operation's own result (if it still completes later) is discarded and the message is left as-is`);
+      resolve(undefined);
+    }, lockTimeoutMs);
+    if (typeof timer.unref === 'function') timer.unref(); // never keep the process alive just for this
+  });
+  return Promise.race([Promise.resolve().then(fn), deadline]).finally(() => clearTimeout(timer));
+}
+
+function withMessageLock(key, fn, lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS) {
   const prev = messageLocks.get(key) || Promise.resolve();
-  const run = prev.then(fn, fn);
-  messageLocks.set(key, run.then(() => undefined, () => undefined));
+  const run = prev.then(() => raceWithDeadline(fn, key, lockTimeoutMs), () => raceWithDeadline(fn, key, lockTimeoutMs));
+  const settleForQueue = run.then(() => undefined, () => undefined);
+  messageLocks.set(key, settleForQueue);
+  settleForQueue.then(() => {
+    if (messageLocks.get(key) === settleForQueue) messageLocks.delete(key);
+  });
   return run;
+}
+
+/** Test-only accessor (not part of the extension's behavior) — lets tests assert the
+ *  lock map doesn't grow without bound. */
+export function _debugLockMapSize() {
+  return messageLocks.size;
 }
 
 /**
@@ -217,8 +299,8 @@ function withMessageLock(key, fn) {
  * in that window would be overwritten by the commit that follows). Orphan bookkeeping
  * is best-effort and now strictly follows the message commit, never precedes it.
  */
-async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator }) {
-  return withMessageLock(`${chatId}::${messageId}`, () => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }));
+async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs }) {
+  return withMessageLock(`${chatId}::${messageId}`, () => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }), lockTimeoutMs);
 }
 
 async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }) {
@@ -228,9 +310,8 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   if (!hasLiveTags(message.content)) return { changed: false };
 
   const existingIds = existingImageIds([message]);
-  const seenMalformed = new Set(message.metadata?.[IDENTIFIER]?.malformedSeen || []);
   const { tags, jobs, skipped, markers } = planMessage(message.content, {
-    registry, maxImages: settings.maxImages, existingImageIds: existingIds, seenMalformed, idGenerator,
+    registry, maxImages: settings.maxImages, existingImageIds: existingIds, idGenerator,
   });
   const resultsById = {};
   const tagIndexToId = new Map();
@@ -240,10 +321,14 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
     resultsById[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
   }
 
+  // Fetched once per message-processing pass (not per tag) — the active main preset
+  // can't change mid-pass, and this avoids N redundant RPCs for an N-image reply.
+  const mainPreset = jobs.length ? await fetchMainPreset(api) : null;
+
   for (const job of jobs) {
     tagIndexToId.set(job.tagIndex, job.id);
     try {
-      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags });
+      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset });
       markers.set(job.tagIndex, { mode: 'replace', text: renderSuccessMarker(job.id, result.imageUrl, job.summary) });
       resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
@@ -276,7 +361,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   let content = fresh.content;
   let cursor = 0;
   const placedImages = {};
-  const placedMalformed = [];
+  let placedMalformedCount = 0;
   const orphanedNow = [];
   tags.forEach((tag, i) => {
     const entry = markers.get(i);
@@ -297,7 +382,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
       const insertAt = at + tag.raw.length;
       content = content.slice(0, insertAt) + entry.text + content.slice(insertAt);
       cursor = insertAt + entry.text.length;
-      placedMalformed.push(tag.raw);
+      placedMalformedCount++;
       return;
     }
     content = content.slice(0, at) + entry.text + content.slice(at + tag.raw.length);
@@ -308,22 +393,18 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 
   const noContentChange = content === fresh.content;
   const noNewImages = Object.keys(placedImages).length === 0;
-  const noNewMalformed = placedMalformed.length === 0;
+  const noNewMalformed = placedMalformedCount === 0;
   if (noContentChange && noNewImages && noNewMalformed) {
-    // nothing could be placed at all (everything orphaned/already-seen) — don't write
-    // an otherwise-identical copy of content/metadata back over whatever is there now.
+    // nothing could be placed at all (everything orphaned/already-annotated) — don't
+    // write an otherwise-identical copy of content/metadata back over what's there now.
     if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
     return { changed: false, orphaned: orphanedNow.length };
   }
 
   const currentImages = fresh.metadata?.[IDENTIFIER]?.images || {};
-  const currentSeenMalformed = fresh.metadata?.[IDENTIFIER]?.malformedSeen || [];
   await api.chat.updateMessage(chatId, messageId, {
     content,
-    metadata: mergeMetadata(fresh.metadata, {
-      images: { ...currentImages, ...placedImages },
-      malformedSeen: [...currentSeenMalformed, ...placedMalformed].slice(-MAX_SEEN_MALFORMED),
-    }),
+    metadata: mergeMetadata(fresh.metadata, { images: { ...currentImages, ...placedImages } }),
   });
   // Orphan bookkeeping strictly AFTER the message commit (review finding 2) — never
   // between the revalidating read and the write.
@@ -334,14 +415,14 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 // `idGenerator` is a test-only hook (never passed in production — see start() below):
 // core.mjs's nextImageId is collision-resistant (time+random) by default; tests inject
 // a deterministic counter so assertions on exact ids stay readable and stable.
-export function createService(api, { idGenerator } = {}) {
+export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
   async function handleGenerationEnded(payload) {
     if (!payload?.chatId || !payload?.messageId) return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, payload.chatId, true))) return;
     const characterId = await characterIdForChat(api, payload.chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator });
+    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs });
   }
 
   async function handleMessageEdited(payload) {
@@ -357,7 +438,7 @@ export function createService(api, { idGenerator } = {}) {
     if (!(await isAutoOn(api, chatId, true))) return;
     const characterId = await characterIdForChat(api, chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator });
+    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs });
   }
 
   function registerInterceptor() {
@@ -418,7 +499,7 @@ export function createService(api, { idGenerator } = {}) {
         return { auto: await isAutoOn(api, payload.chatId, true) };
       case 'regenerate': {
         if (!payload?.chatId || !payload?.messageId || !payload?.imageId) throw new Error('잘못된 요청');
-        return withMessageLock(`${payload.chatId}::${payload.messageId}`, () => regenerateLocked(api, payload));
+        return withMessageLock(`${payload.chatId}::${payload.messageId}`, () => regenerateLocked(api, payload), lockTimeoutMs);
       }
       default:
         throw new Error('알 수 없는 요청');
@@ -444,7 +525,8 @@ async function regenerateLocked(api, payload) {
     // Review finding 4: validate before touching anything — on failure (including an
     // unusable result), the existing marker/metadata for this image is left completely
     // untouched, so a working image is never replaced by a broken one.
-    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags });
+    const mainPreset = await fetchMainPreset(api);
+    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset });
   } catch (err) {
     throw new Error('다시 그리기 실패: ' + String(err?.message || err));
   }

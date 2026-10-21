@@ -46,13 +46,29 @@ function scanTag(text, openIdx) {
   }
 }
 
+// Review (3rd pass) finding 1: idempotency for malformed tags must come from the
+// CONTENT itself, not a side list (a capped metadata list evicts old entries while the
+// physical annotation stays in the message forever, causing endless re-annotation once
+// the distinct-malformed-tag count exceeds the cap — reproduced at 51 distinct tags /
+// 110 passes). Content-based check: if our fixed marker text is found immediately
+// after a malformed span, that occurrence has already been annotated — skip it
+// entirely (no new marker, `end` advances past the existing marker so it's never
+// re-included in a later span). No list, no cap, correct regardless of how many
+// malformed tags exist or how many passes run.
+function checkAnnotated(text, end) {
+  if (text.startsWith(MALFORMED_MARKER_TEXT, end)) {
+    return { annotated: true, end: end + MALFORMED_MARKER_TEXT.length };
+  }
+  return { annotated: false, end };
+}
+
 /**
  * Find every `<pic ...>` occurrence in `content` (well-formed tags, parsed; malformed
  * ones flagged) in document order, non-overlapping. Already-rendered markers
- * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`, `[그림 태그 형식 오류 ...]`)
- * never match (nothing there starts with `<pic` followed by whitespace/`>` — `pic-failed`
- * fails the boundary check), so re-running this on an already-processed message is a
- * no-op — satisfies "never re-process already-rendered images".
+ * (`![그림:...]`, `<pic-failed ...>`, `<pic-skipped ...>`, and an already-annotated
+ * malformed tag's marker) never start a new match of their own (nothing there starts
+ * with `<pic` followed by whitespace/`>`), so re-running this on an already-processed
+ * message is a no-op — satisfies "never re-process already-rendered images".
  */
 export function parseTags(content) {
   const text = String(content ?? '');
@@ -72,41 +88,43 @@ export function parseTags(content) {
       const { attrs } = scanned;
       const hasChars = Object.prototype.hasOwnProperty.call(attrs, 'chars');
       const hasPrompt = Object.prototype.hasOwnProperty.call(attrs, 'prompt');
+      const malformed = !hasChars && !hasPrompt;
+      const raw = text.slice(idx, scanned.end);
+      const { annotated, end } = malformed ? checkAnnotated(text, scanned.end) : { annotated: false, end: scanned.end };
       out.push({
-        start: idx,
-        end: scanned.end,
-        raw: text.slice(idx, scanned.end),
-        malformed: !hasChars && !hasPrompt,
+        start: idx, end, raw, malformed, annotated,
         charsRaw: hasChars ? attrs.chars : '',
         promptRaw: hasPrompt ? attrs.prompt : '',
       });
-      searchFrom = scanned.end;
+      searchFrom = end;
     } else {
       // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
       //
-      // This span is now ONLY used to (a) find a short, stable key for "have we already
-      // flagged this exact broken tag" and (b) decide where to resume scanning for more
-      // `<pic` occurrences — it is NEVER used to delete/replace anything any more (see
+      // This span is now ONLY used to (a) decide where to insert an annotation / detect
+      // an existing one and (b) decide where to resume scanning for more `<pic`
+      // occurrences — it is NEVER used to delete/replace anything (see
       // planMessage/renderMalformedMarker: malformed handling only ever INSERTS a short
       // marker after the untouched original text, never replaces it). Still bounded to
       // a small span regardless of which branch is taken — review (2nd pass) finding 1
       // caught that the `nextLt` fallback below had NO bound at all, so a broken tag
       // followed by a long stretch of real narrative and then any later '<' (even a
-      // genuine later tag far down the message) made `tag.raw` (and therefore the
-      // dedup key) swallow all of that narrative. Capping every branch at BOUND avoids
-      // that regardless of what used to (and no longer does) happen to the swallowed text.
+      // genuine later tag far down the message) made `tag.raw` swallow all of that
+      // narrative. Capping every branch at BOUND avoids that regardless of what used to
+      // (and no longer does) happen to the swallowed text.
       const BOUND = 300;
       const nextLt = text.indexOf('<', idx + 4);
       const nextGt = text.indexOf('>', idx + 4);
-      let end;
+      let rawEnd;
       if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
-        end = nextGt + 1; // include the stray '>' — the broken tag's apparent close
+        rawEnd = nextGt + 1; // include the stray '>' — the broken tag's apparent close
       } else if (nextLt !== -1 && nextLt - idx <= BOUND) {
-        end = nextLt; // stop before whatever starts next (often a later real tag)
+        rawEnd = nextLt; // stop before whatever starts next (often a later real tag)
       } else {
-        end = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
+        rawEnd = Math.min(idx + BOUND, text.length); // no boundary nearby (or too far): bounded cap only
       }
-      out.push({ start: idx, end, raw: text.slice(idx, end), malformed: true, charsRaw: '', promptRaw: '' });
+      const raw = text.slice(idx, rawEnd);
+      const { annotated, end } = checkAnnotated(text, rawEnd);
+      out.push({ start: idx, end, raw, malformed: true, annotated, charsRaw: '', promptRaw: '' });
       searchFrom = end;
     }
   }
@@ -223,6 +241,66 @@ export function assemblePrompt(basePrompt, extraFragments) {
   return [base, extra].filter(Boolean).join(', ');
 }
 
+// ---------------------------------------------------------------- main preset composition (F5, review finding 2 round 3)
+
+// Lumiverse's `{{character_prompt}}`/`{{character_negative_prompt}}` and
+// `{{persona_prompt}}`/`{{persona_negative_prompt}}` macros splice in a card-bound (or
+// persona-bound) preset snippet — but that substitution only happens when the host's
+// OWN prompt-resolution path runs (`image-gen.service.ts` `expandCharacterPromptMacro`),
+// which we deliberately bypass via `skipParse:true` (so our already-exact scene prompt
+// isn't re-parsed). If we naively concatenated the active main preset's text as-is, any
+// of these four tokens in it would reach the provider as literal `{{...}}` text instead
+// of being expanded or removed. Since our own per-character registry (F3) already
+// supplies appearance text via `characterTags`, the correct behavior is to drop these
+// tokens entirely rather than try to expand them ourselves — stripped, not substituted.
+// Token names/regex verified against `image-gen.service.ts` `substituteCharacterPromptMacro`
+// (~1380-1392) and `substitutePersonaPromptMacro` (~1402-1412): case-insensitive,
+// tolerant of internal whitespace.
+const CHAR_PERSONA_MACRO_RE = /\{\{\s*(?:character|persona)_(?:negative_)?prompt\s*\}\}/gi;
+export function stripCharacterPersonaMacros(text) {
+  return String(text ?? '').replace(CHAR_PERSONA_MACRO_RE, '');
+}
+
+/** Joins non-empty prompt fragments with ", ", trimming each fragment's own leading/
+ *  trailing commas and whitespace first so stripping a macro token (which can leave
+ *  "a, , b" or ", b" behind) never produces a doubled or stray leading separator. */
+export function joinPromptParts(parts) {
+  return (parts || [])
+    .map((p) => String(p ?? '').trim())
+    .map((p) => p.replace(/^[,\s]+|[,\s]+$/g, ''))
+    .filter(Boolean)
+    .join(', ');
+}
+
+/**
+ * Compose the final request prompt/negativePrompt from the tag's scene prompt and the
+ * user's active native main image-prompt preset (if any) — review (3rd pass) finding 2:
+ * `imageGen.generateNative()` with an inline `prompt` REPLACES the active preset's own
+ * prompt rather than composing with it (`image-gen.service.ts:1333`: `opts?.prompt ??
+ * preset?.prompt ?? ...` — our prompt always wins the `??` chain since it's never
+ * null/undefined), so the DESIGN.md §4 "main prompt + tag prompt" contract has to be
+ * assembled explicitly here instead of relying on the host to do it.
+ *
+ * `mainPreset` is `{ prompt, negativePrompt } | null` — the active preset fetched via
+ * `spindle.imageGen.getPromptPresets()` (see backend.mjs `fetchMainPreset`), or `null`
+ * if there is none / it couldn't be fetched (scene prompt alone, unchanged from before
+ * this fix — never blocks generation).
+ *
+ * Negative prompt: when the cleaned preset negative is non-empty, it's returned
+ * explicitly (single source — never combined with the connection's own default
+ * negative, avoiding a doubled-up negative prompt). When there's nothing to contribute
+ * (no preset, or an empty/macro-only negative), `negativePrompt` is `undefined` so the
+ * caller can omit the field entirely and let the host's own connection-default
+ * fallback apply exactly as it did before this fix.
+ */
+export function buildFinalPrompt(scenePrompt, mainPreset) {
+  const presetPositive = mainPreset?.prompt ? stripCharacterPersonaMacros(mainPreset.prompt) : '';
+  const prompt = joinPromptParts([presetPositive, scenePrompt]);
+  const rawNegative = mainPreset?.negativePrompt ? stripCharacterPersonaMacros(mainPreset.negativePrompt) : '';
+  const cleanedNegative = joinPromptParts([rawNegative]); // same leading/trailing-comma cleanup as the positive side
+  return { prompt, negativePrompt: cleanedNegative || undefined };
+}
+
 // ---------------------------------------------------------------- markers (F2/F5)
 
 export function summarize(text, max = 40) {
@@ -318,25 +396,24 @@ export function renderMalformedMarker() {
  *    need generation (malformed -> malformed marker, overflow valid tags -> skipped
  *    marker). Tags in `jobs` get their marker filled in later from the generation result.
  */
-export function planMessage(content, { registry = [], maxImages = 2, existingImageIds = [], seenMalformed, idGenerator } = {}) {
+export function planMessage(content, { registry = [], maxImages = 2, existingImageIds = [], idGenerator } = {}) {
   const tags = parseTags(content);
   const jobs = [];
   const skipped = [];
-  const newlyMalformed = [];
   // markers: tagIndex -> { mode: 'replace' | 'insert', text }. 'replace' swaps the
   // original tag text out (success/failure/skip — the whole point of F5). 'insert'
   // (malformed tags only, review finding 1) keeps the original text and only ADDS a
   // short marker right after it, so malformed handling can never shrink the message.
   const markers = new Map();
-  const seen = seenMalformed instanceof Set ? seenMalformed : new Set();
   const usedIds = existingImageIds.slice();
   let validCount = 0;
   tags.forEach((tag, i) => {
     if (tag.malformed) {
-      if (!seen.has(tag.raw)) {
-        markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
-        newlyMalformed.push({ tagIndex: i, raw: tag.raw });
-      }
+      // Review (3rd pass) finding 1: idempotency is now a property of `tag.annotated`
+      // (content-based, computed by parseTags itself — see checkAnnotated) rather than
+      // a side list here, so there is nothing to cap and nothing that can drift out of
+      // sync with what's actually in the message.
+      if (!tag.annotated) markers.set(i, { mode: 'insert', text: renderMalformedMarker() });
       return;
     }
     validCount++;
@@ -352,7 +429,7 @@ export function planMessage(content, { registry = [], maxImages = 2, existingIma
     }
     jobs.push({ tagIndex: i, id, prompt, characterTags, summary: tag.promptRaw });
   });
-  return { tags, jobs, skipped, markers, newlyMalformed };
+  return { tags, jobs, skipped, markers };
 }
 
 /** Splice `content` using parseTags-produced `tags` and a parallel marker map
@@ -537,7 +614,6 @@ const SETTINGS_PATH = 'settings.json';
 const AUTO_VAR_KEY = 'lv_illust.auto';
 const ORPHAN_VAR_KEY = 'lv_illust.orphans';
 const MAX_ORPHANS = 20;
-const MAX_SEEN_MALFORMED = 50;
 
 function extToRegistry(character) {
   return normalizeRegistry(character?.extensions?.[IDENTIFIER]);
@@ -642,11 +718,44 @@ function queuedCall(fn) {
  *     and the chosen-path rationale.
  * Still only requires the `image_gen` permission (`worker-host-image-gen-api.ts:107-110`,
  * same gate as `generate()` — `requirePermission()` checks only `"image_gen"`).
+ *
+ * Review (3rd pass) finding 2: the above only restored the LoRA/style preset. The
+ * user's active native MAIN prompt preset is still not applied by `generateNative()`
+ * itself — `resolvePromptInput` (`image-gen.service.ts:1333`) resolves
+ * `opts?.prompt ?? preset?.prompt ?? ...`, so our inline `prompt` (never null/undefined)
+ * always wins and the preset's own prompt text is silently dropped entirely, not
+ * composed. `skipParse:true` also skips `expandCharacterPromptMacro` (`:1336-1344`), so
+ * even if we did forward the preset text as-is, any `{{character_prompt}}` /
+ * `{{persona_prompt}}` tokens in it would reach the provider as literal text. Fixed:
+ * `fetchMainPreset()` reads the user's active main preset via
+ * `spindle.imageGen.getPromptPresets()` (gated by the same `image_gen` permission,
+ * `worker-host-image-gen-api.ts:340-349` → `image-gen.service.ts:343-349`
+ * `getMainImagePromptPresets`, filtered to `kind:'main'`/legacy-no-kind presets only);
+ * `core.mjs`'s `buildFinalPrompt()` then explicitly composes `preset.prompt + scene
+ * prompt` (macro tokens stripped, not expanded — our own registry/characterTags already
+ * supply per-character appearance, so splicing in a bound character/persona snippet
+ * too would duplicate it) and supplies the preset's own (cleaned) negative prompt only
+ * when non-empty, to avoid doubling with the connection's own default negative. See
+ * docs/API-NOTES.md for the full citation and composition rationale.
  */
-async function generateImage(api, { chatId, prompt, characterTags }) {
+async function fetchMainPreset(api) {
+  if (typeof api.imageGen.getPromptPresets !== 'function') return null; // optional on older hosts
+  try {
+    const result = await api.imageGen.getPromptPresets();
+    if (!result?.activeId || !Array.isArray(result.presets)) return null;
+    const preset = result.presets.find((p) => p.id === result.activeId);
+    return preset ? { prompt: preset.prompt, negativePrompt: preset.negativePrompt } : null;
+  } catch {
+    return null; // never block generation on this — scene prompt alone, same as before this fix
+  }
+}
+
+async function generateImage(api, { chatId, prompt, characterTags, mainPreset }) {
+  const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset);
   const result = await queuedCall(() => api.imageGen.generateNative({
     chat_id: chatId,
-    prompt,
+    prompt: finalPrompt,
+    ...(negativePrompt !== undefined ? { negativePrompt } : {}),
     promptMode: 'custom',
     skipParse: true,
     parameters: { characterTags },
@@ -704,12 +813,62 @@ async function pushOrphans(api, chatId, entries) {
 // one already committed before it plans anything. (core.mjs's `nextImageId` is also
 // collision-resistant by default now, as defense in depth for the case this in-memory
 // lock can't cover — a worker restart mid-generation.)
+//
+// Review (3rd pass) finding 3: two follow-up problems with the lock map itself.
+//
+// (a) Settled entries were never removed — `messageLocks.set()` had no matching
+// `delete()`, so every distinct (chatId, messageId) ever processed left a permanent
+// entry for the life of the worker, including messages with no `<pic>` tags at all
+// (the lock is acquired before that check). Fixed: once an operation settles, its entry
+// is deleted — but ONLY if it is still that key's current (most recently queued) entry.
+// Deleting unconditionally would be wrong: if a second call already queued behind the
+// first and installed its OWN entry for the same key, deleting on the first call's
+// settlement would erase the SECOND call's tracking, letting a third call bypass the
+// queue entirely and run concurrently with the second (reopening finding 3 round 2).
+//
+// (b) No deadline anywhere in the chain: a predecessor operation that hangs (a stuck
+// RPC with no timeout of its own) blocks every later operation queued for that same
+// message forever. Fixed: every operation is raced against a fixed deadline
+// (`lockTimeoutMs`, default 3 minutes); whichever finishes first is what the NEXT
+// queued operation sees as "done". If the deadline wins, this call's own effect is
+// simply never awaited further (nothing it was about to write has been written yet in
+// the common case, since processMessageInner's one and only write happens after every
+// await it needs completes) and the key is freed for the next queued caller. This does
+// NOT cancel the underlying operation (no cancellation primitive is plumbed through
+// arbitrary host RPCs) — if it eventually completes after its result was already
+// discarded, it could still perform its own write uncoordinated with whatever runs
+// next; this residual risk is called out in docs/API-NOTES.md rather than silently
+// assumed away.
+const DEFAULT_LOCK_TIMEOUT_MS = 3 * 60 * 1000;
 const messageLocks = new Map();
-function withMessageLock(key, fn) {
+
+function raceWithDeadline(fn, key, lockTimeoutMs) {
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      console.error(`[lv_illust] message lock for "${key}" timed out after ${lockTimeoutMs}ms — releasing it for the next queued operation; this operation's own result (if it still completes later) is discarded and the message is left as-is`);
+      resolve(undefined);
+    }, lockTimeoutMs);
+    if (typeof timer.unref === 'function') timer.unref(); // never keep the process alive just for this
+  });
+  return Promise.race([Promise.resolve().then(fn), deadline]).finally(() => clearTimeout(timer));
+}
+
+function withMessageLock(key, fn, lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS) {
   const prev = messageLocks.get(key) || Promise.resolve();
-  const run = prev.then(fn, fn);
-  messageLocks.set(key, run.then(() => undefined, () => undefined));
+  const run = prev.then(() => raceWithDeadline(fn, key, lockTimeoutMs), () => raceWithDeadline(fn, key, lockTimeoutMs));
+  const settleForQueue = run.then(() => undefined, () => undefined);
+  messageLocks.set(key, settleForQueue);
+  settleForQueue.then(() => {
+    if (messageLocks.get(key) === settleForQueue) messageLocks.delete(key);
+  });
   return run;
+}
+
+/** Test-only accessor (not part of the extension's behavior) — lets tests assert the
+ *  lock map doesn't grow without bound. */
+export function _debugLockMapSize() {
+  return messageLocks.size;
 }
 
 /**
@@ -734,8 +893,8 @@ function withMessageLock(key, fn) {
  * in that window would be overwritten by the commit that follows). Orphan bookkeeping
  * is best-effort and now strictly follows the message commit, never precedes it.
  */
-async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator }) {
-  return withMessageLock(`${chatId}::${messageId}`, () => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }));
+async function processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs }) {
+  return withMessageLock(`${chatId}::${messageId}`, () => processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }), lockTimeoutMs);
 }
 
 async function processMessageInner(api, { chatId, messageId, registry, settings, idGenerator }) {
@@ -745,9 +904,8 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   if (!hasLiveTags(message.content)) return { changed: false };
 
   const existingIds = existingImageIds([message]);
-  const seenMalformed = new Set(message.metadata?.[IDENTIFIER]?.malformedSeen || []);
   const { tags, jobs, skipped, markers } = planMessage(message.content, {
-    registry, maxImages: settings.maxImages, existingImageIds: existingIds, seenMalformed, idGenerator,
+    registry, maxImages: settings.maxImages, existingImageIds: existingIds, idGenerator,
   });
   const resultsById = {};
   const tagIndexToId = new Map();
@@ -757,10 +915,14 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
     resultsById[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
   }
 
+  // Fetched once per message-processing pass (not per tag) — the active main preset
+  // can't change mid-pass, and this avoids N redundant RPCs for an N-image reply.
+  const mainPreset = jobs.length ? await fetchMainPreset(api) : null;
+
   for (const job of jobs) {
     tagIndexToId.set(job.tagIndex, job.id);
     try {
-      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags });
+      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset });
       markers.set(job.tagIndex, { mode: 'replace', text: renderSuccessMarker(job.id, result.imageUrl, job.summary) });
       resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
@@ -793,7 +955,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   let content = fresh.content;
   let cursor = 0;
   const placedImages = {};
-  const placedMalformed = [];
+  let placedMalformedCount = 0;
   const orphanedNow = [];
   tags.forEach((tag, i) => {
     const entry = markers.get(i);
@@ -814,7 +976,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
       const insertAt = at + tag.raw.length;
       content = content.slice(0, insertAt) + entry.text + content.slice(insertAt);
       cursor = insertAt + entry.text.length;
-      placedMalformed.push(tag.raw);
+      placedMalformedCount++;
       return;
     }
     content = content.slice(0, at) + entry.text + content.slice(at + tag.raw.length);
@@ -825,22 +987,18 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 
   const noContentChange = content === fresh.content;
   const noNewImages = Object.keys(placedImages).length === 0;
-  const noNewMalformed = placedMalformed.length === 0;
+  const noNewMalformed = placedMalformedCount === 0;
   if (noContentChange && noNewImages && noNewMalformed) {
-    // nothing could be placed at all (everything orphaned/already-seen) — don't write
-    // an otherwise-identical copy of content/metadata back over whatever is there now.
+    // nothing could be placed at all (everything orphaned/already-annotated) — don't
+    // write an otherwise-identical copy of content/metadata back over what's there now.
     if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
     return { changed: false, orphaned: orphanedNow.length };
   }
 
   const currentImages = fresh.metadata?.[IDENTIFIER]?.images || {};
-  const currentSeenMalformed = fresh.metadata?.[IDENTIFIER]?.malformedSeen || [];
   await api.chat.updateMessage(chatId, messageId, {
     content,
-    metadata: mergeMetadata(fresh.metadata, {
-      images: { ...currentImages, ...placedImages },
-      malformedSeen: [...currentSeenMalformed, ...placedMalformed].slice(-MAX_SEEN_MALFORMED),
-    }),
+    metadata: mergeMetadata(fresh.metadata, { images: { ...currentImages, ...placedImages } }),
   });
   // Orphan bookkeeping strictly AFTER the message commit (review finding 2) — never
   // between the revalidating read and the write.
@@ -851,14 +1009,14 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 // `idGenerator` is a test-only hook (never passed in production — see start() below):
 // core.mjs's nextImageId is collision-resistant (time+random) by default; tests inject
 // a deterministic counter so assertions on exact ids stay readable and stable.
-export function createService(api, { idGenerator } = {}) {
+export function createService(api, { idGenerator, lockTimeoutMs } = {}) {
   async function handleGenerationEnded(payload) {
     if (!payload?.chatId || !payload?.messageId) return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, payload.chatId, true))) return;
     const characterId = await characterIdForChat(api, payload.chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator });
+    await processMessageLocked(api, { chatId: payload.chatId, messageId: payload.messageId, registry, settings, idGenerator, lockTimeoutMs });
   }
 
   async function handleMessageEdited(payload) {
@@ -874,7 +1032,7 @@ export function createService(api, { idGenerator } = {}) {
     if (!(await isAutoOn(api, chatId, true))) return;
     const characterId = await characterIdForChat(api, chatId);
     const registry = await loadRegistry(api, characterId);
-    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator });
+    await processMessageLocked(api, { chatId, messageId, registry, settings, idGenerator, lockTimeoutMs });
   }
 
   function registerInterceptor() {
@@ -935,7 +1093,7 @@ export function createService(api, { idGenerator } = {}) {
         return { auto: await isAutoOn(api, payload.chatId, true) };
       case 'regenerate': {
         if (!payload?.chatId || !payload?.messageId || !payload?.imageId) throw new Error('잘못된 요청');
-        return withMessageLock(`${payload.chatId}::${payload.messageId}`, () => regenerateLocked(api, payload));
+        return withMessageLock(`${payload.chatId}::${payload.messageId}`, () => regenerateLocked(api, payload), lockTimeoutMs);
       }
       default:
         throw new Error('알 수 없는 요청');
@@ -961,7 +1119,8 @@ async function regenerateLocked(api, payload) {
     // Review finding 4: validate before touching anything — on failure (including an
     // unusable result), the existing marker/metadata for this image is left completely
     // untouched, so a working image is never replaced by a broken one.
-    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags });
+    const mainPreset = await fetchMainPreset(api);
+    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset });
   } catch (err) {
     throw new Error('다시 그리기 실패: ' + String(err?.message || err));
   }

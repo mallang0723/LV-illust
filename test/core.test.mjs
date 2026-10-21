@@ -177,6 +177,50 @@ test('assemblePrompt: base + extra fragments joined, empty parts dropped', () =>
   assert.equal(C.assemblePrompt('', []), '');
 });
 
+// ---------------------------------------------------------------- main preset composition (review, 3rd pass, finding 2)
+
+test('stripCharacterPersonaMacros: removes all four macro tokens, case/whitespace-insensitive', () => {
+  const text = 'A {{character_prompt}} B {{ CHARACTER_NEGATIVE_PROMPT }} C {{persona_prompt}} D {{persona_negative_prompt}} E';
+  assert.equal(C.stripCharacterPersonaMacros(text), 'A  B  C  D  E');
+});
+
+test('stripCharacterPersonaMacros: leaves ordinary text (incl. other macros like {{char}}) untouched', () => {
+  assert.equal(C.stripCharacterPersonaMacros('masterpiece, {{char}}, best quality'), 'masterpiece, {{char}}, best quality');
+  assert.equal(C.stripCharacterPersonaMacros(''), '');
+  assert.equal(C.stripCharacterPersonaMacros(undefined), '');
+});
+
+test('joinPromptParts: joins non-empty parts with ", ", trims stray/doubled separators left by macro stripping', () => {
+  assert.equal(C.joinPromptParts(['watercolor, soft lighting', 'forest']), 'watercolor, soft lighting, forest');
+  assert.equal(C.joinPromptParts(['', 'forest']), 'forest');
+  assert.equal(C.joinPromptParts(['watercolor, ', ', forest']), 'watercolor, forest'); // stray comma left by a stripped macro
+  assert.equal(C.joinPromptParts(['  ', '']), '');
+});
+
+test('buildFinalPrompt: no main preset — scene prompt alone, no negativePrompt field contributed', () => {
+  assert.deepEqual(C.buildFinalPrompt('forest', null), { prompt: 'forest', negativePrompt: undefined });
+  assert.deepEqual(C.buildFinalPrompt('forest', undefined), { prompt: 'forest', negativePrompt: undefined });
+});
+
+test('buildFinalPrompt: main preset positive text precedes the scene prompt; macro tokens stripped, not left as literal text', () => {
+  const mainPreset = { prompt: 'watercolor, soft lighting, {{character_prompt}}', negativePrompt: 'lowres, {{character_negative_prompt}}' };
+  const { prompt, negativePrompt } = C.buildFinalPrompt('forest', mainPreset);
+  assert.equal(prompt, 'watercolor, soft lighting, forest');
+  assert.ok(!prompt.includes('{{'));
+  assert.equal(negativePrompt, 'lowres');
+});
+
+test('buildFinalPrompt: an empty/macro-only preset negative yields undefined (so the host\'s own connection-default fallback applies, not an empty override)', () => {
+  const mainPreset = { prompt: 'style', negativePrompt: '{{character_negative_prompt}}' };
+  const { negativePrompt } = C.buildFinalPrompt('forest', mainPreset);
+  assert.equal(negativePrompt, undefined);
+});
+
+test('buildFinalPrompt: preset with no prompt text at all still yields the scene prompt alone', () => {
+  const { prompt } = C.buildFinalPrompt('forest', { prompt: '', negativePrompt: '' });
+  assert.equal(prompt, 'forest');
+});
+
 // ---------------------------------------------------------------- planning (F2: max images, markers)
 
 test('planMessage: single valid tag produces one job, no markers', () => {
@@ -214,15 +258,14 @@ test('planMessage: malformed tag always gets a marker, never a job, never counte
   assert.ok(entry.text.includes('형식 오류'));
 });
 
-test('planMessage: malformed tag marked "seen" once is never re-flagged on a later pass', () => {
+test('planMessage: a malformed tag already annotated (content-based, no side list) is never re-flagged on a later pass', () => {
   const content = '<pic foo="bar"> narrative continues';
   const first = C.planMessage(content, { registry: [] });
   assert.equal(first.markers.size, 1);
-  assert.equal(first.newlyMalformed.length, 1);
-  const seen = new Set(first.newlyMalformed.map((m) => m.raw));
-  const second = C.planMessage(content, { registry: [], seenMalformed: seen });
-  assert.equal(second.markers.size, 0); // already seen — no new marker, no re-flag
-  assert.equal(second.newlyMalformed.length, 0);
+  const annotated = C.applyMarkers(content, first.tags, first.markers);
+  // re-planning the ANNOTATED content (no side list passed at all) must find nothing to do
+  const second = C.planMessage(annotated, { registry: [] });
+  assert.equal(second.markers.size, 0);
 });
 
 test('planMessage: image ids are unique, avoid existingImageIds, and are never bare sequential by default', () => {
@@ -455,6 +498,58 @@ test('REGRESSION (review finding 1, round 2 — exact repro): an unterminated ta
   // byte — regardless of exactly where in the middle the marker landed.
   const recovered = out.split(C.MALFORMED_MARKER_TEXT).join('');
   assert.equal(recovered, content, 'removing the inserted marker(s) must exactly recover the original message');
+});
+
+// ---------------------------------------------------------------- REGRESSION (review, 3rd pass): malformed-tag
+// idempotency must come from the CONTENT itself (no capped side list to evict and desync from reality).
+
+// Simulates exactly what backend.mjs's processMessageInner does to a message on one pass,
+// restricted to malformed-tag handling (no registry/generation involved): plan, then
+// splice only the 'insert' markers in (malformed tags never get a 'replace' entry).
+function processMalformedOnce(content) {
+  const { tags, markers } = C.planMessage(content, { registry: [] });
+  return C.applyMarkers(content, tags, markers);
+}
+
+function runPasses(content, n) {
+  const writes = [];
+  let current = content;
+  for (let i = 0; i < n; i++) {
+    const next = processMalformedOnce(current);
+    writes.push(next !== current);
+    current = next;
+  }
+  return { final: current, writes };
+}
+
+for (const [label, makeContent] of [
+  ['60 distinct malformed tags', () => Array.from({ length: 60 }, (_, i) => `<pic foo="bar${i}">`).join(' 사이 글 ')],
+  ['an unterminated tag + long prose', () => `<pic prompt="unfinished ${'긴 이야기가 이어진다. '.repeat(60)}`],
+  ['a mix of valid and malformed tags', () => '<pic prompt="ok1"><pic foo="bad1"> 중간 글 <pic prompt="ok2"><pic foo="bad2">'],
+]) {
+  test(`REGRESSION (review, 3rd pass, finding 1): N=20 passes over ${label} — only the first pass writes, the rest are a no-op, and all original text survives`, () => {
+    const content = makeContent();
+    const { final, writes } = runPasses(content, 20);
+    assert.equal(writes[0], true, 'the first pass must actually annotate something');
+    for (let i = 1; i < writes.length; i++) {
+      assert.equal(writes[i], false, `pass ${i + 1} must be a no-op (content unchanged) — got a write instead`);
+    }
+    // re-running processMalformedOnce on the already-stable `final` content one more
+    // time must be byte-for-byte identical (full idempotency, not just "stopped growing")
+    assert.equal(processMalformedOnce(final), final);
+    // every byte of the original content must still be recoverable by removing our markers
+    const recovered = final.split(C.MALFORMED_MARKER_TEXT).join('');
+    assert.equal(recovered, content, 'original text must be byte-for-byte preserved');
+  });
+}
+
+test('REGRESSION (review, 3rd pass, finding 1): a capped/evicting side list is no longer part of the API at all', () => {
+  // planMessage no longer accepts or needs a `seenMalformed` option — idempotency is a
+  // property of the content (tag.annotated from parseTags), not a side list that can
+  // be capped and fall out of sync with what's actually been annotated in the message.
+  const content = '<pic foo="bar">';
+  const { markers: m1 } = C.planMessage(content, { registry: [], seenMalformed: new Set(['garbage']) });
+  assert.equal(m1.size, 1); // an unrecognized option is simply ignored, not silently trusted
 });
 
 test('REGRESSION (review finding 5): a registered alias never matches as a bare prefix of an unrelated word', () => {
