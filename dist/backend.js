@@ -82,12 +82,30 @@ export function parseTags(content) {
       });
       searchFrom = scanned.end;
     } else {
-      // Broken tag: unterminated quote, missing '=', missing closing '>', etc. Capture
-      // through the next '<' (or end of string) so the original text stays recoverable
-      // without runaway length, then keep scanning right after it.
-      let end = text.indexOf('<', idx + 4);
-      if (end === -1) end = text.length;
-      end = Math.min(end, idx + 2000);
+      // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
+      //
+      // Bug found in review: capturing "through the next '<' (or end of string)" ate
+      // every character of real narrative that followed a broken tag whenever nothing
+      // else in the message started with '<' — e.g. `Before <pic prompt=bad> Important
+      // narrative…` had no second '<' anywhere, so the whole rest of the message (the
+      // narrative) was swallowed into the malformed span and then collapsed into a
+      // 200-char marker summary, destroying the story text. Fix: prefer the *nearest*
+      // '>' as the end of a broken tag attempt (that's almost always where the author
+      // meant to close it, quoting or not — see the repro above, which closes cleanly
+      // at "bad>"), only falling back to the next '<' or a small bound when no '>' is
+      // nearby, so a broken tag can never consume more than a short bounded span of
+      // text that follows it.
+      const BOUND = 300;
+      const nextLt = text.indexOf('<', idx + 4);
+      const nextGt = text.indexOf('>', idx + 4);
+      let end;
+      if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
+        end = nextGt + 1; // include the stray '>' — the broken tag's apparent close
+      } else if (nextLt !== -1) {
+        end = nextLt; // stop before whatever starts next (often a later real tag)
+      } else {
+        end = Math.min(idx + BOUND, text.length); // no boundary anywhere nearby: bounded cap only
+      }
       out.push({ start: idx, end, raw: text.slice(idx, end), malformed: true, charsRaw: '', promptRaw: '' });
       searchFrom = end;
     }
@@ -120,6 +138,13 @@ export function normalizeName(s) {
   return String(s ?? '').toLowerCase().replace(/\s+/g, '').trim();
 }
 
+// Lowercased/trimmed but keeping single spaces (collapsing runs of whitespace to one
+// space) — used only for the word-boundary-aware prefix fallback below, where we must
+// be able to tell "a real space follows the alias" from "more letters follow it".
+function normalizeSpaced(s) {
+  return String(s ?? '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
 /**
  * registry: [{ id, names: string[], appearance: string, enabled: boolean }, ...]
  * Builds a flat (normalizedAlias, length, characterIndex) list sorted longest-alias-first,
@@ -130,25 +155,32 @@ function flatAliases(registry) {
   (registry || []).forEach((ch, idx) => {
     for (const n of ch.names || []) {
       const norm = normalizeName(n);
-      if (norm) flat.push({ norm, idx });
+      const spaced = normalizeSpaced(n);
+      if (norm) flat.push({ norm, spaced, idx });
     }
   });
   flat.sort((a, b) => b.norm.length - a.norm.length);
   return flat;
 }
 
-/** Returns the registry index matched by `name`, or -1. Exact match, or the token
- *  starting with "<alias> " (AI appended extra words instead of using the action field). */
+/** Returns the registry index matched by `name`, or -1. Exact match (whitespace/case
+ *  insensitive), or the token beginning with "<alias> " — a real word boundary, not just
+ *  a longer prefix — for when the AI appends extra words instead of using the action
+ *  field (e.g. "아드리안 (미소)"). Review caught a bug here: comparing on the
+ *  whitespace-STRIPPED form let "Anna" match a registered alias "Ann" (no boundary at
+ *  all, just a longer string with the same prefix) — fixed by requiring an actual space
+ *  after the alias in the original (whitespace-collapsed, not stripped) text. */
 export function findCharacterIndex(name, registry) {
   const token = normalizeName(name);
   if (!token) return -1;
-  for (const { norm, idx } of flatAliases(registry)) {
+  const flat = flatAliases(registry);
+  for (const { norm, idx } of flat) {
     if (token === norm) return idx;
   }
-  // fallback: token begins with an alias (word-ish prefix on the *original* spacing,
-  // approximated by comparing the normalized prefix since normalizeName strips spaces)
-  for (const { norm, idx } of flatAliases(registry)) {
-    if (norm && token.startsWith(norm) && token.length > norm.length) return idx;
+  const spacedToken = normalizeSpaced(name);
+  const bySpacedLengthDesc = flat.slice().sort((a, b) => b.spaced.length - a.spaced.length);
+  for (const { spaced, idx } of bySpacedLengthDesc) {
+    if (spaced && spacedToken.startsWith(spaced + ' ')) return idx;
   }
   return -1;
 }
@@ -201,10 +233,6 @@ export function summarize(text, max = 40) {
   return s;
 }
 
-function escapeAttr(s) {
-  return String(s ?? '').replace(/"/g, '”');
-}
-
 /** Next image id for this message: p1, p2, … — stable/deterministic given how many
  *  ids already exist (so re-processing new tags on an edited message doesn't collide
  *  with ids already used by previously rendered images). */
@@ -219,16 +247,31 @@ export function renderSuccessMarker(id, imageUrl, summaryText) {
   return `![그림:${id}|${summarize(summaryText)}](${imageUrl})`;
 }
 
+// Keeps the human-readable summary free of characters that could ever confuse a regex
+// that looks for the fixed `<pic-failed id="...">` / `<pic-skipped id="...">` sentinel
+// that follows it (review finding: the previous design embedded the raw chars/prompt
+// attribute text straight into the sentinel tag, and since a tag's `prompt="..."` value
+// is allowed to contain a literal '>' — see scanTag, which only disallows '<' and '"'
+// inside a value, not '>' — a prompt containing '>' would make the old
+// `<pic-failed[^>]*>`-style regexes stop too early, breaking regenerate's replace AND
+// the history strip-down). Fix: the sentinel tag now carries *only* an opaque id — all
+// recoverable structured data (prompt/characterTags) lives in message metadata, which
+// is where regenerate already reads it from — so the regex matching it can be a fixed,
+// unambiguous string with no wildcard anywhere near a quote.
+function markerSafeSummary(text) {
+  return summarize(text, 60).replace(/"/g, '”').replace(/[<>]/g, '');
+}
+
 export function renderFailureMarker(id, tag, reason) {
-  const chars = tag.charsRaw ? ` chars="${escapeAttr(tag.charsRaw)}"` : '';
-  const prompt = tag.promptRaw ? ` prompt="${escapeAttr(tag.promptRaw)}"` : '';
-  return `[⚠️ 그림 생성 실패(${reason || '오류'}) · 패널에서 '다시 그리기'로 재시도 <pic-failed id="${id}"${chars}${prompt}>]`;
+  const summary = markerSafeSummary(tag.promptRaw || tag.charsRaw || tag.raw);
+  const shown = summary ? ` · "${summary}"` : '';
+  return `[⚠️ 그림 생성 실패(${reason || '오류'})${shown} · 패널에서 '다시 그리기'로 재시도 <pic-failed id="${id}">]`;
 }
 
 export function renderSkippedMarker(id, tag) {
-  const chars = tag.charsRaw ? ` chars="${escapeAttr(tag.charsRaw)}"` : '';
-  const prompt = tag.promptRaw ? ` prompt="${escapeAttr(tag.promptRaw)}"` : '';
-  return `[한 답변당 그림 상한(2장)을 넘어 건너뜀 · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}"${chars}${prompt}>]`;
+  const summary = markerSafeSummary(tag.promptRaw || tag.charsRaw || tag.raw);
+  const shown = summary ? ` · "${summary}"` : '';
+  return `[한 답변당 그림 상한(2장)을 넘어 건너뜀${shown} · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}">]`;
 }
 
 export function renderMalformedMarker(tag) {
@@ -295,8 +338,11 @@ export function applyMarkers(content, tags, replacements) {
 // ---------------------------------------------------------------- history placeholder rewrite
 
 const RENDERED_IMG_RE = /!\[그림:[a-z0-9]+\|([^\]]*)\]\([^)]*\)/g;
-const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed[^>]*>\]/g;
-const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped[^>]*>\]/g;
+// Anchored on the fixed `<pic-failed id="...">` / `<pic-skipped id="...">` tail (no
+// chars/prompt attributes any more — see renderFailureMarker/renderSkippedMarker), so
+// there's no wildcard adjacent to a quote that a prompt containing '>' could break.
+const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed id="[a-z0-9]+">\]/g;
+const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped id="[a-z0-9]+">\]/g;
 const MALFORMED_RE = /\[그림 태그 형식 오류 — 원본: ([^\]]*)\]/g;
 
 /** For prompt assembly over past turns: collapse any of our rendered/failure/skip/
@@ -318,6 +364,24 @@ export function hasLiveTags(content) {
   return parseTags(content).length > 0;
 }
 
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Regex matching the ONE marker occurrence for a given image id — either its rendered
+ *  image, or its failed/skipped sentinel — for regenerate's in-place replace. Exported
+ *  so backend.mjs doesn't hand-roll its own copy of this pattern (review finding: the
+ *  old inline version in backend.mjs used a `[^>]*`-style wildcard next to an attribute
+ *  value that could itself contain '>', which could fail to match and silently leave
+ *  the stale marker in place while still reporting success). Single source of truth. */
+export function markerRegexForId(id) {
+  const idRe = escapeRegExp(id);
+  return new RegExp(
+    `!\\[그림:${idRe}\\|[^\\]]*\\]\\([^)]*\\)` +
+    `|\\[[^[\\]]*<pic-(?:failed|skipped) id="${idRe}">\\]`,
+  );
+}
+
 // ---------------------------------------------------------------- F1 instruction injection
 
 export const DEFAULT_SETTINGS = {
@@ -336,17 +400,35 @@ export function normalizeSettings(raw) {
   return s;
 }
 
+// Strips newlines/control characters and caps length before an alias is ever quoted
+// into the system/user/assistant-role instruction message — review flagged that aliases
+// (typed by the user into the registry panel, F4) went into that message verbatim, so a
+// stray pasted newline (or a block of text someone fat-fingered into the name field)
+// could inject extra lines into the instruction. Single-user tool, so this isn't an
+// external-attacker threat model, but it's cheap, correct hygiene regardless.
+function sanitizeAliasForInstruction(name) {
+  return String(name ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ') // control chars incl. newlines -> space
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
 /** Enabled characters' alias lists, for the AI instruction (§2: list registered
  *  names so the AI uses them verbatim, any alias accepted regardless of chat language). */
 export function instructionNameList(registry) {
   return (registry || []).filter((c) => c.enabled && c.names?.length)
-    .map((c) => c.names.filter(Boolean).join(' / '));
+    .map((c) => c.names.map(sanitizeAliasForInstruction).filter(Boolean).map((n) => `"${n}"`).join(' / '))
+    .filter(Boolean);
 }
 
 export function buildInstructionText(registry) {
   const names = instructionNameList(registry);
+  // Roster lines are presented as quoted data (each alias wrapped in literal quotes),
+  // not as free-form instruction text, so a sanitized-but-still-plain-looking alias
+  // can't be read as part of the instruction's own sentence structure.
   const roster = names.length
-    ? `\n등장인물 목록(아무 별칭이나 그대로 사용 가능):\n- ${names.join('\n- ')}`
+    ? `\n등장인물 목록(따옴표 안 글자 그대로 사용 가능, 아무 별칭이나 써도 됨):\n- ${names.join('\n- ')}`
     : '';
   return (
     '그림이 필요한 장면에서는 답변 중간에 다음 형식의 태그를 한 번 써라(최대 2개): ' +
@@ -400,6 +482,8 @@ export function normalizeRegistry(raw) {
 
 const SETTINGS_PATH = 'settings.json';
 const AUTO_VAR_KEY = 'lv_illust.auto';
+const ORPHAN_VAR_KEY = 'lv_illust.orphans';
+const MAX_ORPHANS = 20;
 
 function extToRegistry(character) {
   return normalizeRegistry(character?.extensions?.[IDENTIFIER]);
@@ -489,10 +573,46 @@ function mergeMetadata(existingMetadata, images) {
   return { ...(existingMetadata || {}), [IDENTIFIER]: { images } };
 }
 
+// Review finding 1: a generated-but-homeless image (its message was edited/swiped/
+// deleted out from under it while generation was in flight, so there's no live tag
+// occurrence left to splice the result into) is never silently discarded — it's kept
+// here, per chat, so the panel's image list can still show it to the user instead of
+// it just vanishing. Free-tier chat variable storage, same tier as the auto-gen flag.
+async function loadOrphans(api, chatId) {
+  try {
+    const has = await api.variables.chat.has(chatId, ORPHAN_VAR_KEY);
+    if (!has) return [];
+    const raw = await api.variables.chat.get(chatId, ORPHAN_VAR_KEY);
+    const parsed = JSON.parse(raw || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function pushOrphans(api, chatId, entries) {
+  if (!entries.length) return;
+  const existing = await loadOrphans(api, chatId);
+  const next = [...existing, ...entries].slice(-MAX_ORPHANS);
+  await api.variables.chat.set(chatId, ORPHAN_VAR_KEY, JSON.stringify(next));
+}
+
 /**
  * Process one assistant message's `<pic>` tags: generate images for up to
- * `settings.maxImages` valid tags (concurrency 1 — SharedNAI limit), splice markers
- * into the message content, and persist results in message metadata.
+ * `settings.maxImages` valid tags (concurrency 1 — SharedNAI limit), then splice
+ * markers into the message and persist results in message metadata.
+ *
+ * Review finding 1 (BLOCKER): the original version read `message` once at the top,
+ * awaited generation (which can take many seconds), and then wrote `content`/`metadata`
+ * computed from that STALE snapshot — silently reverting any edit, swipe, or another
+ * extension's metadata write that happened during the wait. Fixed: `message` here is
+ * only used to decide WHAT to generate (the plan); the actual write re-fetches the
+ * CURRENT message right before saving, locates each tag by its own verbatim raw text
+ * (not a stored offset, which the current content may no longer agree with) within the
+ * CURRENT content, and refuses to touch anything if the message's active swipe changed
+ * underneath it — in that case the generated image(s) are preserved as "orphans"
+ * instead (see pushOrphans) rather than overwriting whatever the content/metadata
+ * became in the meantime.
  */
 async function processMessage(api, { chatId, message, registry, settings }) {
   if (!hasLiveTags(message.content)) return { changed: false };
@@ -500,15 +620,16 @@ async function processMessage(api, { chatId, message, registry, settings }) {
   const { tags, jobs, skipped, markers } = planMessage(message.content, {
     registry, maxImages: settings.maxImages, existingImageIds: existingIds,
   });
-  const imageRecords = { ...(message.metadata?.[IDENTIFIER]?.images || {}) };
+  const resultsById = {};
+  const tagIndexToId = new Map();
 
-  // skipped (over the per-reply cap) still get a metadata record so the regenerate
-  // panel can offer "다시 그리기" for them too, generating on demand.
   for (const s of skipped) {
-    imageRecords[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
+    tagIndexToId.set(s.tagIndex, s.id);
+    resultsById[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
   }
 
   for (const job of jobs) {
+    tagIndexToId.set(job.tagIndex, job.id);
     try {
       const result = await queuedGenerate(api, {
         prompt: job.prompt,
@@ -517,26 +638,71 @@ async function processMessage(api, { chatId, message, registry, settings }) {
         includeDataUrl: false,
       });
       markers.set(job.tagIndex, renderSuccessMarker(job.id, result.imageUrl, job.summary));
-      imageRecords[job.id] = {
+      resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
         imageId: result.imageId, imageUrl: result.imageUrl, summary: job.summary,
       };
     } catch (err) {
       const reason = String(err?.message || err || '오류').slice(0, 80);
       markers.set(job.tagIndex, renderFailureMarker(job.id, tags[job.tagIndex], reason));
-      imageRecords[job.id] = {
+      resultsById[job.id] = {
         status: 'fail', prompt: job.prompt, characterTags: job.characterTags,
         reason, summary: job.summary,
       };
     }
   }
 
-  const newContent = applyMarkers(message.content, tags, markers);
-  await api.chat.updateMessage(chatId, message.id, {
-    content: newContent,
-    metadata: mergeMetadata(message.metadata, imageRecords),
+  // --- everything above only decided *what* to do; everything below re-checks the
+  // live message right before writing anything. ---
+  const freshList = await api.chat.getMessages(chatId);
+  const fresh = freshList.find((m) => m.id === message.id);
+  const swipeChanged = !fresh || (fresh.swipe_id ?? 0) !== (message.swipe_id ?? 0);
+  if (swipeChanged) {
+    const orphans = Object.entries(resultsById).map(([id, r]) => ({
+      id, messageId: message.id, ts: Date.now(),
+      reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...r,
+    }));
+    await pushOrphans(api, chatId, orphans);
+    return { changed: false, orphaned: orphans.length };
+  }
+
+  let content = fresh.content;
+  let cursor = 0;
+  const placedImages = {};
+  const orphanedNow = [];
+  tags.forEach((tag, i) => {
+    if (!markers.has(i)) return;
+    const marker = markers.get(i);
+    let at = content.indexOf(tag.raw, cursor);
+    if (at === -1) at = content.indexOf(tag.raw); // retry from the start: order may have shifted
+    const id = tagIndexToId.get(i);
+    if (at === -1) {
+      // the exact original tag text is gone from the current content (edited away
+      // mid-generation) — never guess at a splice location.
+      if (id && resultsById[id]) {
+        orphanedNow.push({ id, messageId: message.id, ts: Date.now(), reason: '그림 자리(태그)가 수정되어 넣지 못함', ...resultsById[id] });
+      }
+      return;
+    }
+    content = content.slice(0, at) + marker + content.slice(at + tag.raw.length);
+    cursor = at + marker.length;
+    if (id && resultsById[id]) placedImages[id] = resultsById[id];
   });
-  return { changed: true, content: newContent };
+
+  if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
+
+  if (content === fresh.content && Object.keys(placedImages).length === 0) {
+    // every generated image was orphaned (nothing left to splice in) — don't write an
+    // otherwise-identical copy of content/metadata back over whatever is currently there.
+    return { changed: false, orphaned: orphanedNow.length };
+  }
+
+  const currentImages = fresh.metadata?.[IDENTIFIER]?.images || {};
+  await api.chat.updateMessage(chatId, message.id, {
+    content,
+    metadata: mergeMetadata(fresh.metadata, { ...currentImages, ...placedImages }),
+  });
+  return { changed: true, content, orphaned: orphanedNow.length };
 }
 
 export function createService(api) {
@@ -609,6 +775,13 @@ export function createService(api) {
             out.push({ id, messageId: m.id, status: rec.status, summary: rec.summary, imageUrl: rec.imageUrl });
           }
         }
+        // Orphaned generations (review finding 1: produced but couldn't be spliced back
+        // into any live message because it changed underneath them) — shown read-only
+        // so nothing a generation actually produced is silently lost.
+        const orphans = await loadOrphans(api, payload.chatId);
+        for (const o of orphans) {
+          out.push({ id: o.id, messageId: o.messageId, status: 'orphan', summary: o.summary, imageUrl: o.imageUrl, reason: o.reason });
+        }
         return { images: out };
       }
       case 'load_auto':
@@ -622,29 +795,47 @@ export function createService(api) {
         if (!message) throw new Error('메시지를 찾을 수 없습니다');
         const rec = message.metadata?.[IDENTIFIER]?.images?.[payload.imageId];
         if (!rec) throw new Error('다시 그릴 정보를 찾을 수 없습니다');
+        const originalSwipeId = message.swipe_id ?? 0;
+        let result;
         try {
-          const result = await queuedGenerate(api, {
+          result = await queuedGenerate(api, {
             prompt: rec.prompt, parameters: { characterTags: rec.characterTags },
             owner_chat_id: payload.chatId, includeDataUrl: false,
           });
-          const marker = renderSuccessMarker(payload.imageId, result.imageUrl, rec.summary);
-          const idRe = payload.imageId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const newContent = message.content.replace(
-            new RegExp(
-              `!\\[그림:${idRe}\\|[^\\]]*\\]\\([^)]*\\)` + // previously rendered image
-              `|\\[[^[\\]]*<pic-(?:failed|skipped) id="${idRe}"[^>]*>\\]`, // failed/skipped marker for this id
-            ),
-            marker,
-          );
-          const images = { ...(message.metadata?.[IDENTIFIER]?.images || {}) };
-          images[payload.imageId] = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
-          await api.chat.updateMessage(payload.chatId, message.id, {
-            content: newContent, metadata: mergeMetadata(message.metadata, images),
-          });
-          return { ok: true };
         } catch (err) {
           throw new Error('다시 그리기 실패: ' + String(err?.message || err));
         }
+        // Review finding 1 (same race as processMessage): re-fetch right before writing
+        // instead of reusing the message read before the (possibly multi-second) await
+        // above. Finding 6: locate the marker with the shared, opaque-id-only regex —
+        // and if `.replace()` doesn't actually find it, that's a real failure, not a
+        // silent no-op reported as success.
+        const freshList = await api.chat.getMessages(payload.chatId);
+        const fresh = freshList.find((m) => m.id === payload.messageId);
+        const updated = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
+        if (!fresh || (fresh.swipe_id ?? 0) !== originalSwipeId) {
+          await pushOrphans(api, payload.chatId, [{
+            id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+            reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...updated,
+          }]);
+          throw new Error('다시 그리는 동안 메시지가 바뀌어 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
+        }
+        const marker = renderSuccessMarker(payload.imageId, result.imageUrl, rec.summary);
+        const re = markerRegexForId(payload.imageId);
+        if (!re.test(fresh.content)) {
+          await pushOrphans(api, payload.chatId, [{
+            id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+            reason: '그림 자리(태그)가 수정되어 넣지 못함', ...updated,
+          }]);
+          throw new Error('그림 자리를 찾지 못해 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
+        }
+        const newContent = fresh.content.replace(re, marker);
+        const currentImages = { ...(fresh.metadata?.[IDENTIFIER]?.images || {}) };
+        currentImages[payload.imageId] = updated;
+        await api.chat.updateMessage(payload.chatId, message.id, {
+          content: newContent, metadata: mergeMetadata(fresh.metadata, currentImages),
+        });
+        return { ok: true };
       }
       default:
         throw new Error('알 수 없는 요청');

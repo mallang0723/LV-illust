@@ -11,13 +11,15 @@
 // this file only sequences async calls around it.
 
 import {
-  normalizeSettings, normalizeRegistry, planMessage, applyMarkers,
+  normalizeSettings, normalizeRegistry, planMessage,
   renderSuccessMarker, renderFailureMarker, stripRenderedImages, hasLiveTags,
-  injectInstruction, IDENTIFIER,
+  injectInstruction, markerRegexForId, IDENTIFIER,
 } from './core.mjs';
 
 const SETTINGS_PATH = 'settings.json';
 const AUTO_VAR_KEY = 'lv_illust.auto';
+const ORPHAN_VAR_KEY = 'lv_illust.orphans';
+const MAX_ORPHANS = 20;
 
 function extToRegistry(character) {
   return normalizeRegistry(character?.extensions?.[IDENTIFIER]);
@@ -107,10 +109,46 @@ function mergeMetadata(existingMetadata, images) {
   return { ...(existingMetadata || {}), [IDENTIFIER]: { images } };
 }
 
+// Review finding 1: a generated-but-homeless image (its message was edited/swiped/
+// deleted out from under it while generation was in flight, so there's no live tag
+// occurrence left to splice the result into) is never silently discarded — it's kept
+// here, per chat, so the panel's image list can still show it to the user instead of
+// it just vanishing. Free-tier chat variable storage, same tier as the auto-gen flag.
+async function loadOrphans(api, chatId) {
+  try {
+    const has = await api.variables.chat.has(chatId, ORPHAN_VAR_KEY);
+    if (!has) return [];
+    const raw = await api.variables.chat.get(chatId, ORPHAN_VAR_KEY);
+    const parsed = JSON.parse(raw || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function pushOrphans(api, chatId, entries) {
+  if (!entries.length) return;
+  const existing = await loadOrphans(api, chatId);
+  const next = [...existing, ...entries].slice(-MAX_ORPHANS);
+  await api.variables.chat.set(chatId, ORPHAN_VAR_KEY, JSON.stringify(next));
+}
+
 /**
  * Process one assistant message's `<pic>` tags: generate images for up to
- * `settings.maxImages` valid tags (concurrency 1 — SharedNAI limit), splice markers
- * into the message content, and persist results in message metadata.
+ * `settings.maxImages` valid tags (concurrency 1 — SharedNAI limit), then splice
+ * markers into the message and persist results in message metadata.
+ *
+ * Review finding 1 (BLOCKER): the original version read `message` once at the top,
+ * awaited generation (which can take many seconds), and then wrote `content`/`metadata`
+ * computed from that STALE snapshot — silently reverting any edit, swipe, or another
+ * extension's metadata write that happened during the wait. Fixed: `message` here is
+ * only used to decide WHAT to generate (the plan); the actual write re-fetches the
+ * CURRENT message right before saving, locates each tag by its own verbatim raw text
+ * (not a stored offset, which the current content may no longer agree with) within the
+ * CURRENT content, and refuses to touch anything if the message's active swipe changed
+ * underneath it — in that case the generated image(s) are preserved as "orphans"
+ * instead (see pushOrphans) rather than overwriting whatever the content/metadata
+ * became in the meantime.
  */
 async function processMessage(api, { chatId, message, registry, settings }) {
   if (!hasLiveTags(message.content)) return { changed: false };
@@ -118,15 +156,16 @@ async function processMessage(api, { chatId, message, registry, settings }) {
   const { tags, jobs, skipped, markers } = planMessage(message.content, {
     registry, maxImages: settings.maxImages, existingImageIds: existingIds,
   });
-  const imageRecords = { ...(message.metadata?.[IDENTIFIER]?.images || {}) };
+  const resultsById = {};
+  const tagIndexToId = new Map();
 
-  // skipped (over the per-reply cap) still get a metadata record so the regenerate
-  // panel can offer "다시 그리기" for them too, generating on demand.
   for (const s of skipped) {
-    imageRecords[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
+    tagIndexToId.set(s.tagIndex, s.id);
+    resultsById[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
   }
 
   for (const job of jobs) {
+    tagIndexToId.set(job.tagIndex, job.id);
     try {
       const result = await queuedGenerate(api, {
         prompt: job.prompt,
@@ -135,26 +174,71 @@ async function processMessage(api, { chatId, message, registry, settings }) {
         includeDataUrl: false,
       });
       markers.set(job.tagIndex, renderSuccessMarker(job.id, result.imageUrl, job.summary));
-      imageRecords[job.id] = {
+      resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
         imageId: result.imageId, imageUrl: result.imageUrl, summary: job.summary,
       };
     } catch (err) {
       const reason = String(err?.message || err || '오류').slice(0, 80);
       markers.set(job.tagIndex, renderFailureMarker(job.id, tags[job.tagIndex], reason));
-      imageRecords[job.id] = {
+      resultsById[job.id] = {
         status: 'fail', prompt: job.prompt, characterTags: job.characterTags,
         reason, summary: job.summary,
       };
     }
   }
 
-  const newContent = applyMarkers(message.content, tags, markers);
-  await api.chat.updateMessage(chatId, message.id, {
-    content: newContent,
-    metadata: mergeMetadata(message.metadata, imageRecords),
+  // --- everything above only decided *what* to do; everything below re-checks the
+  // live message right before writing anything. ---
+  const freshList = await api.chat.getMessages(chatId);
+  const fresh = freshList.find((m) => m.id === message.id);
+  const swipeChanged = !fresh || (fresh.swipe_id ?? 0) !== (message.swipe_id ?? 0);
+  if (swipeChanged) {
+    const orphans = Object.entries(resultsById).map(([id, r]) => ({
+      id, messageId: message.id, ts: Date.now(),
+      reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...r,
+    }));
+    await pushOrphans(api, chatId, orphans);
+    return { changed: false, orphaned: orphans.length };
+  }
+
+  let content = fresh.content;
+  let cursor = 0;
+  const placedImages = {};
+  const orphanedNow = [];
+  tags.forEach((tag, i) => {
+    if (!markers.has(i)) return;
+    const marker = markers.get(i);
+    let at = content.indexOf(tag.raw, cursor);
+    if (at === -1) at = content.indexOf(tag.raw); // retry from the start: order may have shifted
+    const id = tagIndexToId.get(i);
+    if (at === -1) {
+      // the exact original tag text is gone from the current content (edited away
+      // mid-generation) — never guess at a splice location.
+      if (id && resultsById[id]) {
+        orphanedNow.push({ id, messageId: message.id, ts: Date.now(), reason: '그림 자리(태그)가 수정되어 넣지 못함', ...resultsById[id] });
+      }
+      return;
+    }
+    content = content.slice(0, at) + marker + content.slice(at + tag.raw.length);
+    cursor = at + marker.length;
+    if (id && resultsById[id]) placedImages[id] = resultsById[id];
   });
-  return { changed: true, content: newContent };
+
+  if (orphanedNow.length) await pushOrphans(api, chatId, orphanedNow);
+
+  if (content === fresh.content && Object.keys(placedImages).length === 0) {
+    // every generated image was orphaned (nothing left to splice in) — don't write an
+    // otherwise-identical copy of content/metadata back over whatever is currently there.
+    return { changed: false, orphaned: orphanedNow.length };
+  }
+
+  const currentImages = fresh.metadata?.[IDENTIFIER]?.images || {};
+  await api.chat.updateMessage(chatId, message.id, {
+    content,
+    metadata: mergeMetadata(fresh.metadata, { ...currentImages, ...placedImages }),
+  });
+  return { changed: true, content, orphaned: orphanedNow.length };
 }
 
 export function createService(api) {
@@ -227,6 +311,13 @@ export function createService(api) {
             out.push({ id, messageId: m.id, status: rec.status, summary: rec.summary, imageUrl: rec.imageUrl });
           }
         }
+        // Orphaned generations (review finding 1: produced but couldn't be spliced back
+        // into any live message because it changed underneath them) — shown read-only
+        // so nothing a generation actually produced is silently lost.
+        const orphans = await loadOrphans(api, payload.chatId);
+        for (const o of orphans) {
+          out.push({ id: o.id, messageId: o.messageId, status: 'orphan', summary: o.summary, imageUrl: o.imageUrl, reason: o.reason });
+        }
         return { images: out };
       }
       case 'load_auto':
@@ -240,29 +331,47 @@ export function createService(api) {
         if (!message) throw new Error('메시지를 찾을 수 없습니다');
         const rec = message.metadata?.[IDENTIFIER]?.images?.[payload.imageId];
         if (!rec) throw new Error('다시 그릴 정보를 찾을 수 없습니다');
+        const originalSwipeId = message.swipe_id ?? 0;
+        let result;
         try {
-          const result = await queuedGenerate(api, {
+          result = await queuedGenerate(api, {
             prompt: rec.prompt, parameters: { characterTags: rec.characterTags },
             owner_chat_id: payload.chatId, includeDataUrl: false,
           });
-          const marker = renderSuccessMarker(payload.imageId, result.imageUrl, rec.summary);
-          const idRe = payload.imageId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const newContent = message.content.replace(
-            new RegExp(
-              `!\\[그림:${idRe}\\|[^\\]]*\\]\\([^)]*\\)` + // previously rendered image
-              `|\\[[^[\\]]*<pic-(?:failed|skipped) id="${idRe}"[^>]*>\\]`, // failed/skipped marker for this id
-            ),
-            marker,
-          );
-          const images = { ...(message.metadata?.[IDENTIFIER]?.images || {}) };
-          images[payload.imageId] = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
-          await api.chat.updateMessage(payload.chatId, message.id, {
-            content: newContent, metadata: mergeMetadata(message.metadata, images),
-          });
-          return { ok: true };
         } catch (err) {
           throw new Error('다시 그리기 실패: ' + String(err?.message || err));
         }
+        // Review finding 1 (same race as processMessage): re-fetch right before writing
+        // instead of reusing the message read before the (possibly multi-second) await
+        // above. Finding 6: locate the marker with the shared, opaque-id-only regex —
+        // and if `.replace()` doesn't actually find it, that's a real failure, not a
+        // silent no-op reported as success.
+        const freshList = await api.chat.getMessages(payload.chatId);
+        const fresh = freshList.find((m) => m.id === payload.messageId);
+        const updated = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
+        if (!fresh || (fresh.swipe_id ?? 0) !== originalSwipeId) {
+          await pushOrphans(api, payload.chatId, [{
+            id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+            reason: '메시지가 바뀌어(스와이프 변경/삭제) 넣지 못함', ...updated,
+          }]);
+          throw new Error('다시 그리는 동안 메시지가 바뀌어 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
+        }
+        const marker = renderSuccessMarker(payload.imageId, result.imageUrl, rec.summary);
+        const re = markerRegexForId(payload.imageId);
+        if (!re.test(fresh.content)) {
+          await pushOrphans(api, payload.chatId, [{
+            id: payload.imageId, messageId: payload.messageId, ts: Date.now(),
+            reason: '그림 자리(태그)가 수정되어 넣지 못함', ...updated,
+          }]);
+          throw new Error('그림 자리를 찾지 못해 반영하지 못했습니다. 그림은 보관되어 목록에서 볼 수 있습니다.');
+        }
+        const newContent = fresh.content.replace(re, marker);
+        const currentImages = { ...(fresh.metadata?.[IDENTIFIER]?.images || {}) };
+        currentImages[payload.imageId] = updated;
+        await api.chat.updateMessage(payload.chatId, message.id, {
+          content: newContent, metadata: mergeMetadata(fresh.metadata, currentImages),
+        });
+        return { ok: true };
       }
       default:
         throw new Error('알 수 없는 요청');

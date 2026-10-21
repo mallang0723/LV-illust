@@ -48,8 +48,18 @@ function el(tag, attrs = {}, ...kids) {
 
 export function setup(ctx) {
   let alive = true, modal = null, chatId = null, characterId = null, seq = 0;
+  // Review finding 4: a late response from a SUPERSEDED load (e.g. the user closed the
+  // panel and reopened it for a different card before the first load finished) used to
+  // land in `view` regardless, so card A's registry could flash over — or silently
+  // replace — card B's. `loadToken` fixes that: every open() mints a new token, and
+  // loadAll() only commits its results if its own token is still the current one.
+  let loadToken = 0;
   const pending = new Map();
-  const view = { settings: null, registry: [], auto: true, images: [], status: '', kind: '', busy: false };
+  // view.chatId/characterId are the SNAPSHOT this panel's data actually belongs to
+  // (captured once per open(), not the live, possibly-already-moved-on outer
+  // chatId/characterId vars) — every write (save/toggle/regenerate) targets these, not
+  // whatever card happens to be active by the time the write fires.
+  const view = { settings: null, registry: [], auto: true, images: [], status: '', kind: '', busy: false, ready: false, chatId: null, characterId: null };
 
   const action = ctx.ui.registerInputBarAction({ id: 'lv-illust', label: '삽화가 설정', iconSvg: ICON, enabled: false });
 
@@ -77,26 +87,30 @@ export function setup(ctx) {
 
   function setStatus(text, kind = '') { view.status = text; view.kind = kind; const s = modal?.root.querySelector('.lvil-status'); if (s) { s.textContent = text; s.dataset.kind = kind; } }
 
-  async function loadAll() {
-    setStatus('불러오는 중…');
+  async function loadAll(token, snapChatId, snapCharacterId) {
     const [s, r, a, i] = await Promise.all([
       request({ type: 'load_settings' }),
-      characterId ? request({ type: 'load_registry', characterId }) : Promise.resolve({ ok: true, registry: [] }),
-      request({ type: 'load_auto', chatId }),
-      request({ type: 'list_images', chatId }),
+      snapCharacterId ? request({ type: 'load_registry', characterId: snapCharacterId }) : Promise.resolve({ ok: true, registry: [] }),
+      request({ type: 'load_auto', chatId: snapChatId }),
+      request({ type: 'list_images', chatId: snapChatId }),
     ]);
-    if (!alive) return;
+    if (!alive || token !== loadToken) return; // superseded by a newer open() — discard
+    const allOk = s.ok && r.ok && a.ok && i.ok;
     if (s.ok) view.settings = s.settings;
     if (r.ok) view.registry = r.registry;
     if (a.ok) view.auto = a.auto;
     if (i.ok) view.images = i.images;
-    setStatus('');
+    view.ready = allOk;
+    setStatus(allOk ? '' : (s.error || r.error || a.error || i.error || '일부 정보를 불러오지 못했습니다'), allOk ? '' : 'err');
     render();
   }
 
   async function saveSettings(patch) {
+    if (!view.ready || view.busy) return;
+    const token = loadToken;
     view.busy = true; render();
     const r = await request({ type: 'save_settings', settings: { ...view.settings, ...patch } });
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) view.settings = r.settings;
     render();
@@ -104,30 +118,51 @@ export function setup(ctx) {
   }
 
   async function toggleAuto() {
+    if (!view.ready || view.busy) return;
+    const token = loadToken, targetChatId = view.chatId;
     view.busy = true; render();
-    const r = await request({ type: 'set_auto', chatId, on: !view.auto });
+    const r = await request({ type: 'set_auto', chatId: targetChatId, on: !view.auto });
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) view.auto = r.auto;
     render();
   }
 
   async function saveRegistry(next) {
-    if (!characterId) return;
+    if (!view.ready || view.busy || !view.characterId) return;
+    const token = loadToken, targetCharacterId = view.characterId;
     view.busy = true; render();
-    const r = await request({ type: 'save_registry', characterId, registry: next });
+    const r = await request({ type: 'save_registry', characterId: targetCharacterId, registry: next });
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) view.registry = r.registry;
     render();
     setStatus(r.ok ? '등록부 저장됨' : (r.error || '실패'), r.ok ? 'ok' : 'err');
   }
 
+  function addDraftCharacter() {
+    // Review finding 3: this used to call saveRegistry() immediately with a brand-new
+    // {names: [], ...} entry — but normalizeRegistry() (core.mjs) correctly drops any
+    // entry with no names (an unnamed character can't ever be matched against), so the
+    // "+ 인물 추가" button silently did nothing, and starting from an empty registry
+    // there was no way to ever add a first character. Fix: the new row is purely local
+    // view state until its own "저장" button is clicked with a non-empty name — it is
+    // never round-tripped through save_registry (and thus never dropped) before that.
+    if (!view.ready || view.busy) return;
+    view.registry = [...view.registry, { names: [], appearance: '', enabled: true }];
+    render();
+  }
+
   async function regenerate(imageId, messageId) {
+    if (!view.ready || view.busy) return;
+    const token = loadToken, targetChatId = view.chatId;
     view.busy = true; render();
-    const r = await request({ type: 'regenerate', chatId, messageId, imageId }, 60000);
+    const r = await request({ type: 'regenerate', chatId: targetChatId, messageId, imageId }, 60000);
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) {
-      const i = await request({ type: 'list_images', chatId });
-      if (i.ok) view.images = i.images;
+      const i = await request({ type: 'list_images', chatId: targetChatId });
+      if (alive && token === loadToken && i.ok) view.images = i.images;
     }
     render();
     setStatus(r.ok ? '다시 그렸습니다' : (r.error || '실패'), r.ok ? 'ok' : 'err');
@@ -135,13 +170,14 @@ export function setup(ctx) {
 
   function settingsSection() {
     const s = view.settings || {};
-    const posSel = el('select', { on: { change: (e) => saveSettings({ position: e.target.value }) } },
+    const dis = view.busy || !view.ready;
+    const posSel = el('select', { disabled: dis, on: { change: (e) => saveSettings({ position: e.target.value }) } },
       ['start', 'end', 'depth'].map((p) => el('option', { value: p, selected: s.position === p, text: p === 'start' ? '맨 앞' : p === 'end' ? '맨 끝' : '깊이(최근 N번째 앞)' })));
-    const depthInput = el('input', { type: 'text', inputmode: 'numeric', value: String(s.depth ?? 4), disabled: s.position !== 'depth',
+    const depthInput = el('input', { type: 'text', inputmode: 'numeric', value: String(s.depth ?? 4), disabled: dis || s.position !== 'depth',
       on: { change: (e) => { const n = parseInt(e.target.value, 10); if (Number.isInteger(n) && n >= 0) saveSettings({ depth: n }); } } });
-    const roleSel = el('select', { on: { change: (e) => saveSettings({ role: e.target.value }) } },
+    const roleSel = el('select', { disabled: dis, on: { change: (e) => saveSettings({ role: e.target.value }) } },
       ['system', 'user', 'assistant'].map((r) => el('option', { value: r, selected: s.role === r, text: r })));
-    const maxSel = el('select', { on: { change: (e) => saveSettings({ maxImages: parseInt(e.target.value, 10) }) } },
+    const maxSel = el('select', { disabled: dis, on: { change: (e) => saveSettings({ maxImages: parseInt(e.target.value, 10) }) } },
       [1, 2].map((n) => el('option', { value: String(n), selected: s.maxImages === n, text: n + '장' })));
     return el('section', {},
       el('h4', { text: '⚙️ 설정 (계정 전체)' }),
@@ -149,7 +185,7 @@ export function setup(ctx) {
       el('div', { class: 'lvil-row' }, el('span', {}, '지시 역할'), roleSel),
       el('div', { class: 'lvil-row' }, el('span', {}, '답변당 최대 그림'), maxSel),
       el('div', { class: 'lvil-note', text: '이 채팅 자동 생성:' },
-        el('button', { type: 'button', 'data-active': String(view.auto), disabled: view.busy, text: view.auto ? '켜짐 (끄기)' : '꺼짐 (켜기)',
+        el('button', { type: 'button', 'data-active': String(view.auto), disabled: view.busy || !view.ready, text: view.auto ? '켜짐 (끄기)' : '꺼짐 (켜기)',
           on: { click: toggleAuto } })));
   }
 
@@ -157,15 +193,16 @@ export function setup(ctx) {
     const namesInput = el('input', { type: 'text', value: ch.names.join(', '), placeholder: '이름/별칭 (쉼표로 구분)' });
     const appearanceInput = el('textarea', { placeholder: '외형 프롬프트 (NAI 태그)' });
     appearanceInput.value = ch.appearance;
-    const enabledBtn = el('button', { type: 'button', 'data-active': String(ch.enabled), text: ch.enabled ? '켜짐' : '꺼짐',
+    const dis = view.busy || !view.ready;
+    const enabledBtn = el('button', { type: 'button', 'data-active': String(ch.enabled), disabled: dis, text: ch.enabled ? '켜짐' : '꺼짐',
       on: { click: () => { list[idx] = { ...ch, enabled: !ch.enabled }; saveRegistry(list); } } });
-    const saveBtn = el('button', { type: 'button', text: '저장', on: { click: () => {
+    const saveBtn = el('button', { type: 'button', disabled: dis, text: '저장', on: { click: () => {
       const names = namesInput.value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
       if (!names.length) { setStatus('이름을 한 개 이상 입력해 주세요', 'err'); return; }
       list[idx] = { ...ch, names, appearance: appearanceInput.value };
       saveRegistry(list);
     } } });
-    const delBtn = el('button', { type: 'button', text: '삭제', on: { click: () => {
+    const delBtn = el('button', { type: 'button', disabled: dis, text: '삭제', on: { click: () => {
       const next = list.slice(0, idx).concat(list.slice(idx + 1));
       saveRegistry(next);
     } } });
@@ -173,12 +210,10 @@ export function setup(ctx) {
   }
 
   function registrySection() {
-    if (!characterId) return el('section', {}, el('h4', { text: '👤 인물 외형 등록부' }), el('div', { class: 'lvil-note', text: '캐릭터 카드를 연 채팅에서만 편집할 수 있습니다.' }));
+    if (!view.characterId) return el('section', {}, el('h4', { text: '👤 인물 외형 등록부' }), el('div', { class: 'lvil-note', text: '캐릭터 카드를 연 채팅에서만 편집할 수 있습니다.' }));
     const list = view.registry.slice();
     const rows = list.map((ch, i) => charRow(ch, i, list));
-    const addBtn = el('button', { type: 'button', text: '+ 인물 추가', on: { click: () => {
-      saveRegistry([...list, { names: [], appearance: '', enabled: true }]);
-    } } });
+    const addBtn = el('button', { type: 'button', text: '+ 인물 추가', disabled: !view.ready || view.busy, on: { click: addDraftCharacter } });
     return el('section', {}, el('h4', { text: '👤 인물 외형 등록부 (이 카드의 모든 채팅과 공유)' }), ...rows, addBtn,
       el('div', { class: 'lvil-note', text: '등록부는 비어서 시작합니다. 여기서 추가한 인물만 이름 매칭에 쓰입니다.' }));
   }
@@ -191,7 +226,7 @@ export function setup(ctx) {
     const rows = view.images.map((img) => el('div', { class: 'lvil-img' },
       el('img', { src: img.imageUrl || '', alt: '' }),
       el('div', { class: 'sum', text: img.summary || img.id }),
-      el('button', { type: 'button', disabled: view.busy, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
+      el('button', { type: 'button', disabled: view.busy || !view.ready, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
     return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }), ...rows);
   }
 
@@ -210,8 +245,17 @@ export function setup(ctx) {
     try { modal = ctx.ui.showModal({ title: '삽화가 (개인용)', width: 480, maxHeight: 720 }); } catch { return; }
     modal.root.style.overflowY = 'auto';
     modal.onDismiss(() => { modal = null; });
+    // Snapshot which card/chat this panel instance belongs to, and bump the load token
+    // BEFORE clearing view state, so any in-flight loadAll() from a previous open() is
+    // immediately recognized as stale once it resolves (review finding 4).
+    const token = ++loadToken;
+    const snapChatId = chatId, snapCharacterId = characterId;
+    Object.assign(view, {
+      settings: null, registry: [], auto: true, images: [], ready: false, busy: false,
+      chatId: snapChatId, characterId: snapCharacterId, status: '불러오는 중…', kind: '',
+    });
     render();
-    await loadAll();
+    await loadAll(token, snapChatId, snapCharacterId);
   }
 
   const offClick = action.onClick(() => { open(); });

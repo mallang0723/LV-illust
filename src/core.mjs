@@ -81,12 +81,30 @@ export function parseTags(content) {
       });
       searchFrom = scanned.end;
     } else {
-      // Broken tag: unterminated quote, missing '=', missing closing '>', etc. Capture
-      // through the next '<' (or end of string) so the original text stays recoverable
-      // without runaway length, then keep scanning right after it.
-      let end = text.indexOf('<', idx + 4);
-      if (end === -1) end = text.length;
-      end = Math.min(end, idx + 2000);
+      // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
+      //
+      // Bug found in review: capturing "through the next '<' (or end of string)" ate
+      // every character of real narrative that followed a broken tag whenever nothing
+      // else in the message started with '<' — e.g. `Before <pic prompt=bad> Important
+      // narrative…` had no second '<' anywhere, so the whole rest of the message (the
+      // narrative) was swallowed into the malformed span and then collapsed into a
+      // 200-char marker summary, destroying the story text. Fix: prefer the *nearest*
+      // '>' as the end of a broken tag attempt (that's almost always where the author
+      // meant to close it, quoting or not — see the repro above, which closes cleanly
+      // at "bad>"), only falling back to the next '<' or a small bound when no '>' is
+      // nearby, so a broken tag can never consume more than a short bounded span of
+      // text that follows it.
+      const BOUND = 300;
+      const nextLt = text.indexOf('<', idx + 4);
+      const nextGt = text.indexOf('>', idx + 4);
+      let end;
+      if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
+        end = nextGt + 1; // include the stray '>' — the broken tag's apparent close
+      } else if (nextLt !== -1) {
+        end = nextLt; // stop before whatever starts next (often a later real tag)
+      } else {
+        end = Math.min(idx + BOUND, text.length); // no boundary anywhere nearby: bounded cap only
+      }
       out.push({ start: idx, end, raw: text.slice(idx, end), malformed: true, charsRaw: '', promptRaw: '' });
       searchFrom = end;
     }
@@ -119,6 +137,13 @@ export function normalizeName(s) {
   return String(s ?? '').toLowerCase().replace(/\s+/g, '').trim();
 }
 
+// Lowercased/trimmed but keeping single spaces (collapsing runs of whitespace to one
+// space) — used only for the word-boundary-aware prefix fallback below, where we must
+// be able to tell "a real space follows the alias" from "more letters follow it".
+function normalizeSpaced(s) {
+  return String(s ?? '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
 /**
  * registry: [{ id, names: string[], appearance: string, enabled: boolean }, ...]
  * Builds a flat (normalizedAlias, length, characterIndex) list sorted longest-alias-first,
@@ -129,25 +154,32 @@ function flatAliases(registry) {
   (registry || []).forEach((ch, idx) => {
     for (const n of ch.names || []) {
       const norm = normalizeName(n);
-      if (norm) flat.push({ norm, idx });
+      const spaced = normalizeSpaced(n);
+      if (norm) flat.push({ norm, spaced, idx });
     }
   });
   flat.sort((a, b) => b.norm.length - a.norm.length);
   return flat;
 }
 
-/** Returns the registry index matched by `name`, or -1. Exact match, or the token
- *  starting with "<alias> " (AI appended extra words instead of using the action field). */
+/** Returns the registry index matched by `name`, or -1. Exact match (whitespace/case
+ *  insensitive), or the token beginning with "<alias> " — a real word boundary, not just
+ *  a longer prefix — for when the AI appends extra words instead of using the action
+ *  field (e.g. "아드리안 (미소)"). Review caught a bug here: comparing on the
+ *  whitespace-STRIPPED form let "Anna" match a registered alias "Ann" (no boundary at
+ *  all, just a longer string with the same prefix) — fixed by requiring an actual space
+ *  after the alias in the original (whitespace-collapsed, not stripped) text. */
 export function findCharacterIndex(name, registry) {
   const token = normalizeName(name);
   if (!token) return -1;
-  for (const { norm, idx } of flatAliases(registry)) {
+  const flat = flatAliases(registry);
+  for (const { norm, idx } of flat) {
     if (token === norm) return idx;
   }
-  // fallback: token begins with an alias (word-ish prefix on the *original* spacing,
-  // approximated by comparing the normalized prefix since normalizeName strips spaces)
-  for (const { norm, idx } of flatAliases(registry)) {
-    if (norm && token.startsWith(norm) && token.length > norm.length) return idx;
+  const spacedToken = normalizeSpaced(name);
+  const bySpacedLengthDesc = flat.slice().sort((a, b) => b.spaced.length - a.spaced.length);
+  for (const { spaced, idx } of bySpacedLengthDesc) {
+    if (spaced && spacedToken.startsWith(spaced + ' ')) return idx;
   }
   return -1;
 }
@@ -200,10 +232,6 @@ export function summarize(text, max = 40) {
   return s;
 }
 
-function escapeAttr(s) {
-  return String(s ?? '').replace(/"/g, '”');
-}
-
 /** Next image id for this message: p1, p2, … — stable/deterministic given how many
  *  ids already exist (so re-processing new tags on an edited message doesn't collide
  *  with ids already used by previously rendered images). */
@@ -218,16 +246,31 @@ export function renderSuccessMarker(id, imageUrl, summaryText) {
   return `![그림:${id}|${summarize(summaryText)}](${imageUrl})`;
 }
 
+// Keeps the human-readable summary free of characters that could ever confuse a regex
+// that looks for the fixed `<pic-failed id="...">` / `<pic-skipped id="...">` sentinel
+// that follows it (review finding: the previous design embedded the raw chars/prompt
+// attribute text straight into the sentinel tag, and since a tag's `prompt="..."` value
+// is allowed to contain a literal '>' — see scanTag, which only disallows '<' and '"'
+// inside a value, not '>' — a prompt containing '>' would make the old
+// `<pic-failed[^>]*>`-style regexes stop too early, breaking regenerate's replace AND
+// the history strip-down). Fix: the sentinel tag now carries *only* an opaque id — all
+// recoverable structured data (prompt/characterTags) lives in message metadata, which
+// is where regenerate already reads it from — so the regex matching it can be a fixed,
+// unambiguous string with no wildcard anywhere near a quote.
+function markerSafeSummary(text) {
+  return summarize(text, 60).replace(/"/g, '”').replace(/[<>]/g, '');
+}
+
 export function renderFailureMarker(id, tag, reason) {
-  const chars = tag.charsRaw ? ` chars="${escapeAttr(tag.charsRaw)}"` : '';
-  const prompt = tag.promptRaw ? ` prompt="${escapeAttr(tag.promptRaw)}"` : '';
-  return `[⚠️ 그림 생성 실패(${reason || '오류'}) · 패널에서 '다시 그리기'로 재시도 <pic-failed id="${id}"${chars}${prompt}>]`;
+  const summary = markerSafeSummary(tag.promptRaw || tag.charsRaw || tag.raw);
+  const shown = summary ? ` · "${summary}"` : '';
+  return `[⚠️ 그림 생성 실패(${reason || '오류'})${shown} · 패널에서 '다시 그리기'로 재시도 <pic-failed id="${id}">]`;
 }
 
 export function renderSkippedMarker(id, tag) {
-  const chars = tag.charsRaw ? ` chars="${escapeAttr(tag.charsRaw)}"` : '';
-  const prompt = tag.promptRaw ? ` prompt="${escapeAttr(tag.promptRaw)}"` : '';
-  return `[한 답변당 그림 상한(2장)을 넘어 건너뜀 · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}"${chars}${prompt}>]`;
+  const summary = markerSafeSummary(tag.promptRaw || tag.charsRaw || tag.raw);
+  const shown = summary ? ` · "${summary}"` : '';
+  return `[한 답변당 그림 상한(2장)을 넘어 건너뜀${shown} · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}">]`;
 }
 
 export function renderMalformedMarker(tag) {
@@ -294,8 +337,11 @@ export function applyMarkers(content, tags, replacements) {
 // ---------------------------------------------------------------- history placeholder rewrite
 
 const RENDERED_IMG_RE = /!\[그림:[a-z0-9]+\|([^\]]*)\]\([^)]*\)/g;
-const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed[^>]*>\]/g;
-const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped[^>]*>\]/g;
+// Anchored on the fixed `<pic-failed id="...">` / `<pic-skipped id="...">` tail (no
+// chars/prompt attributes any more — see renderFailureMarker/renderSkippedMarker), so
+// there's no wildcard adjacent to a quote that a prompt containing '>' could break.
+const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed id="[a-z0-9]+">\]/g;
+const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped id="[a-z0-9]+">\]/g;
 const MALFORMED_RE = /\[그림 태그 형식 오류 — 원본: ([^\]]*)\]/g;
 
 /** For prompt assembly over past turns: collapse any of our rendered/failure/skip/
@@ -317,6 +363,24 @@ export function hasLiveTags(content) {
   return parseTags(content).length > 0;
 }
 
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Regex matching the ONE marker occurrence for a given image id — either its rendered
+ *  image, or its failed/skipped sentinel — for regenerate's in-place replace. Exported
+ *  so backend.mjs doesn't hand-roll its own copy of this pattern (review finding: the
+ *  old inline version in backend.mjs used a `[^>]*`-style wildcard next to an attribute
+ *  value that could itself contain '>', which could fail to match and silently leave
+ *  the stale marker in place while still reporting success). Single source of truth. */
+export function markerRegexForId(id) {
+  const idRe = escapeRegExp(id);
+  return new RegExp(
+    `!\\[그림:${idRe}\\|[^\\]]*\\]\\([^)]*\\)` +
+    `|\\[[^[\\]]*<pic-(?:failed|skipped) id="${idRe}">\\]`,
+  );
+}
+
 // ---------------------------------------------------------------- F1 instruction injection
 
 export const DEFAULT_SETTINGS = {
@@ -335,17 +399,35 @@ export function normalizeSettings(raw) {
   return s;
 }
 
+// Strips newlines/control characters and caps length before an alias is ever quoted
+// into the system/user/assistant-role instruction message — review flagged that aliases
+// (typed by the user into the registry panel, F4) went into that message verbatim, so a
+// stray pasted newline (or a block of text someone fat-fingered into the name field)
+// could inject extra lines into the instruction. Single-user tool, so this isn't an
+// external-attacker threat model, but it's cheap, correct hygiene regardless.
+function sanitizeAliasForInstruction(name) {
+  return String(name ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ') // control chars incl. newlines -> space
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
 /** Enabled characters' alias lists, for the AI instruction (§2: list registered
  *  names so the AI uses them verbatim, any alias accepted regardless of chat language). */
 export function instructionNameList(registry) {
   return (registry || []).filter((c) => c.enabled && c.names?.length)
-    .map((c) => c.names.filter(Boolean).join(' / '));
+    .map((c) => c.names.map(sanitizeAliasForInstruction).filter(Boolean).map((n) => `"${n}"`).join(' / '))
+    .filter(Boolean);
 }
 
 export function buildInstructionText(registry) {
   const names = instructionNameList(registry);
+  // Roster lines are presented as quoted data (each alias wrapped in literal quotes),
+  // not as free-form instruction text, so a sanitized-but-still-plain-looking alias
+  // can't be read as part of the instruction's own sentence structure.
   const roster = names.length
-    ? `\n등장인물 목록(아무 별칭이나 그대로 사용 가능):\n- ${names.join('\n- ')}`
+    ? `\n등장인물 목록(따옴표 안 글자 그대로 사용 가능, 아무 별칭이나 써도 됨):\n- ${names.join('\n- ')}`
     : '';
   return (
     '그림이 필요한 장면에서는 답변 중간에 다음 형식의 태그를 한 번 써라(최대 2개): ' +

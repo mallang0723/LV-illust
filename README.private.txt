@@ -6,11 +6,18 @@ src/backend.mjs  GENERATION_ENDED/MESSAGE_EDITED 처리, imageGen.generate, chat
                  registerInterceptor(F1 지시 끼워넣기 + 히스토리 그림 자리 요약)
 src/frontend.mjs 입력창 버튼 '삽화가 설정' + 호스트 모달(설정/등록부/자동생성 토글/이 채팅 그림 목록)
 scripts/build.mjs  src -> dist (의존성 없음). 빌드: node scripts/build.mjs
-test/            node --test test/*.test.mjs — 2026-10-21 기준 전부 통과 (리뷰 반영 후 73개)
+scripts/pack.mjs   dist/+spindle.json+README* -> release/lv_illust-<version>.zip (재현 가능한 빌드,
+                   고정 타임스탬프 + zip -X, 두 번 빌드해도 바이트 단위로 동일함 확인됨)
+test/            node --test test/*.test.mjs — 2026-10-21 기준 전부 통과, 89개(두 차례 리뷰 반영 후)
 
 문서
 docs/DESIGN.md     설계안(사용자 승인본)
-docs/API-NOTES.md  이 확장이 의존하는 루미버스 API — 근거 파일:줄, VERIFIED/INFERRED/UNVERIFIED 표기
+docs/API-NOTES.md  이 확장이 의존하는 루미버스 API — 근거 파일:줄, VERIFIED/INFERRED/UNVERIFIED 표기,
+                   매니페스트 유효성 확인, 2차 검토(Codex) 7건 전수 대조 결과 포함
+README.md / README.en.md  공개 가능한 수준의 설명(한/영) — 기능·권한과 이유·설치(Import Local /
+                   GitHub Install from Source)·알려진 한계. 실제로는 올리지 않음(로컬 전용).
+
+.review/host/      2차 독립 검토용으로 받아 둔 루미버스 호스트 소스 읽기 전용 사본(gitignored, 커밋 안 됨).
 
 설치는 설치방법.txt 참고. 클린룸: SillyGgu/AutoPic 코드는 열람·참고하지 않았음(동작 설명만 docs/DESIGN.md에서 받음).
 
@@ -21,14 +28,29 @@ docs/API-NOTES.md  이 확장이 의존하는 루미버스 API — 근거 파일
   chatId/message.id뿐이고 나머지(내용·메타데이터·is_user)는 전부 chat.getMessages로 다시 읽어 확인하므로,
   추정이 틀려도 조용히 아무 일도 안 함(안전하게 실패)이지 다른 확장 메타데이터를 덮어쓰지 않음.
 - registerMessageAction(말풍선 버튼)은 존재를 확인했지만 이번 MVP엔 안 씀 — 패널의 "다시 그리기" 목록만.
-- 그림 생성 중 같은 메시지를 수정/스와이프하면 생성이 끝날 때 옛 내용 기준으로 덮어쓸 수 있음(경쟁 상태,
-  고치지 않음 — 드문 경우라 MVP 범위 밖으로 둠).
 
 검토 이력 메모
-- 1차 구현에서 "generation" 권한을 빠뜨려 GENERATION_ENDED 구독 자체가 막히는 치명적 버그가 있었음
-  (worker-host.ts의 handleSubscribeEvent가 생성 관련 이벤트를 generation 권한으로 게이트).
-  동료 검토에서 발견, spindle.json/설치방법.txt/API-NOTES에 반영 완료.
-- 같은 검토에서 형식 오류 마커가 '<'를 이스케이프하지 않아 재처리 시 무한 증식할 수 있는 버그,
-  인터셉터가 멀티모달(배열) content를 문자열화해 버리는 버그, imageGen.generate 동시 호출 상한(1)이
-  실제로는 강제되지 않던 문제, MESSAGE_EDITED 처리가 검증 안 된 payload 필드를 그대로 신뢰하던 문제를
-  함께 발견·수정함 (전부 테스트로 고정).
+1차(자체 검토, advisor): "generation" 권한을 빠뜨려 GENERATION_ENDED 구독 자체가 막히는 치명적 버그
+  (worker-host.ts의 handleSubscribeEvent가 생성 관련 이벤트를 generation 권한으로 게이트), 형식 오류
+  마커가 '<'를 이스케이프하지 않아 재처리 시 무한 증식하는 버그, 인터셉터가 멀티모달(배열) content를
+  문자열화해 버리는 버그, imageGen.generate 동시 호출 상한(1)이 실제로는 강제되지 않던 문제,
+  MESSAGE_EDITED 처리가 검증 안 된 payload 필드를 그대로 신뢰하던 문제 — 전부 발견·수정, 테스트로 고정.
+
+2차(독립 검토, Codex): 7건 전부 코드 대조 결과 실제 버그로 확인되어 전부 수정(기각 0건).
+  - 블로커 2건: (1) 그림 생성 대기 중 메시지가 바뀌면 그 변경을 되돌려 쓰던 경쟁 상태 — 쓰기 직전에
+    메시지를 다시 읽고, 태그 원문으로 현재 내용 속 위치를 다시 찾고, 스와이프가 바뀌었으면 아예 쓰지
+    않고 "넣지 못함" 상태로 보관(lv_illust.orphans)하도록 수정. (2) 형식이 깨진 태그 복구 로직이 다음
+    '<'나 메시지 끝까지를 통째로 집어삼켜(실측 사례: 뒤따르는 서사 문단이 통째로 날아감) 200자 요약으로
+    뭉개 버리던 버그 — 가장 가까운 '>'를 우선 경계로 쓰고, 그래도 없으면 300자로만 제한하도록 수정.
+  - 메이저 2건: (3) 빈 등록부에서 "+ 인물 추가"가 이름 없는 항목을 즉시 저장해 서버 쪽 정규화가
+    버려버려 아무 일도 안 하던 버그(등록부가 빈 상태로 시작해야 하는 요구사항과 정면으로 충돌) — 이름을
+    넣기 전까지는 로컬 임시 행으로만 두도록 수정. (4) 패널이 카드를 바꿔 가며 빠르게 열고 닫으면 먼저
+    보낸(이미 낡은) 요청의 응답이 나중에 도착해 새 카드의 화면·데이터를 덮어쓰던 경쟁 상태 — 매 열기마다
+    토큰을 올리고, 낡은 토큰의 응답은 버리고, 읽기가 성공하기 전엔 쓰기(저장·토글·다시 그리기)를 막도록
+    수정.
+  - 마이너 3건: (5) 별칭 부분일치 보정이 공백 없이 "Anna"가 "Ann"에 걸리던 버그 — 실제 띄어쓰기 경계를
+    요구하도록 수정. (6) 실패/건너뜀 표시에 넣은 원문이 '>'를 포함하면 정규식이 거기서 멈춰 다시
+    그리기·히스토리 정리가 깨지던 버그 — 표시에는 id만 남기고(원문은 이미 메타데이터에 있음) 공용 정규식
+    하나로 통일. (7) 등록부 이름에 줄바꿈이 섞여 들어가면 지시문에 그대로 꽂히던 문제 — 제어문자 제거 +
+    길이 제한 + 따옴표로 인용해 표시하도록 수정.
+  전부 회귀 테스트 추가(핵심 로직 54개 + 백엔드 25개 + 프론트 10개 = 89개, 전부 통과).

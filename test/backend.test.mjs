@@ -102,8 +102,8 @@ test('GENERATION_ENDED failure: visible failure marker, original tag info kept i
 
   const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
   assert.ok(patch.content.includes('⚠️ 그림 생성 실패'));
-  assert.ok(patch.content.includes('pic-failed id="p1"'));
-  assert.ok(patch.content.includes('prompt="골목"'));
+  assert.ok(patch.content.includes('<pic-failed id="p1">'));
+  assert.ok(patch.content.includes('"골목"')); // human-readable summary, not a raw prompt="..." attribute
   assert.equal(patch.metadata.lv_illust.images.p1.status, 'fail');
   // "아드리안" isn't in any registry here (no character/registry set up for this test),
   // so it passes through as an extra prompt fragment rather than a characterTags entry.
@@ -272,7 +272,7 @@ test('set_auto / load_auto round-trip per chat', async () => {
 // ---------------------------------------------------------------- regenerate (F6)
 
 test('regenerate: re-runs generation for a stored record and replaces the failure marker with a rendered image', async () => {
-  const content = '[⚠️ 그림 생성 실패(오류) · 패널에서 \'다시 그리기\'로 재시도 <pic-failed id="p1" prompt="골목">]';
+  const content = '[⚠️ 그림 생성 실패(오류) · "골목" · 패널에서 \'다시 그리기\'로 재시도 <pic-failed id="p1">]';
   const msg = assistantMsg('m1', content, { lv_illust: { images: { p1: { status: 'fail', prompt: '골목', characterTags: [], summary: '골목' } } } });
   const f = fakeApi({ messages: { c1: [msg] } });
   const svc = createService(f.api);
@@ -324,4 +324,102 @@ test('start(): wires GENERATION_ENDED, MESSAGE_EDITED, interceptor and frontend 
   const dispose = start(f.api);
   assert.equal(typeof dispose, 'function');
   dispose();
+});
+
+// ---------------------------------------------------------------- REGRESSION: review finding 1 (stale-read race)
+
+test('REGRESSION: a user edit made DURING generation is not reverted — the new text survives, image becomes an orphan', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="scene">');
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    chats: { c1: { id: 'c1' } },
+    generateImpl: (input) => {
+      // simulate the user editing the message WHILE generation is in flight — the exact
+      // tag text this job was generated for no longer exists anywhere in the message
+      msg.content = '완전히 다른 내용으로 고쳤습니다.';
+      return { imageId: 'img1', imageUrl: 'https://img/1.png' };
+    },
+  });
+  const svc = createService(f.api);
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  // the edit must survive verbatim — NOT reverted to the pre-generation snapshot and
+  // NOT overwritten with a marker spliced into the old (stale) position
+  assert.equal(msg.content, '완전히 다른 내용으로 고쳤습니다.');
+  // the generated image is not silently discarded — it's recorded as an orphan
+  const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
+  const orphan = images.find((i) => i.status === 'orphan');
+  assert.ok(orphan, 'generated image must be recoverable from the orphan list');
+  assert.equal(orphan.imageUrl, 'https://img/1.png');
+});
+
+test('REGRESSION: a swipe navigated away DURING generation leaves the (now active) other swipe untouched', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="scene">');
+  msg.swipe_id = 0;
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    chats: { c1: { id: 'c1' } },
+    generateImpl: () => {
+      msg.swipe_id = 1; // user navigated to a different swipe mid-generation
+      msg.content = '다른 스와이프의 내용';
+      return { imageId: 'img1', imageUrl: 'https://img/1.png' };
+    },
+  });
+  const svc = createService(f.api);
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  assert.equal(msg.content, '다른 스와이프의 내용'); // never touched
+  const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
+  assert.ok(images.some((i) => i.status === 'orphan' && i.imageUrl === 'https://img/1.png'));
+});
+
+test('REGRESSION: a concurrent metadata write from another extension survives the write-back', async () => {
+  const msg = assistantMsg('m1', '<pic prompt="scene">');
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    chats: { c1: { id: 'c1' } },
+    generateImpl: () => {
+      // another (hypothetical) extension writes its own namespaced metadata key while
+      // this extension's generation is still in flight
+      msg.metadata = { ...(msg.metadata || {}), some_other_extension: { note: 'hello' } };
+      return { imageId: 'img1', imageUrl: 'https://img/1.png' };
+    },
+  });
+  const svc = createService(f.api);
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, , , patch] = f.calls.find((c) => c[0] === 'updateMessage');
+  assert.deepEqual(patch.metadata.some_other_extension, { note: 'hello' });
+  assert.equal(patch.metadata.lv_illust.images.p1.status, 'ok');
+});
+
+test('REGRESSION: regenerate re-fetches before writing and never reverts a concurrent edit', async () => {
+  const content = '[⚠️ 그림 생성 실패(오류) · "골목" · 패널에서 \'다시 그리기\'로 재시도 <pic-failed id="p1">]';
+  const msg = assistantMsg('m1', content, { lv_illust: { images: { p1: { status: 'fail', prompt: '골목', characterTags: [], summary: '골목' } } } });
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    generateImpl: () => {
+      msg.content = content + ' 추가로 적은 내용';
+      return { imageId: 'img1', imageUrl: 'https://img/1.png' };
+    },
+  });
+  const svc = createService(f.api);
+  const res = await svc.runFrontendRequest({ type: 'regenerate', chatId: 'c1', messageId: 'm1', imageId: 'p1' });
+  assert.equal(res.ok, true);
+  assert.ok(msg.content.includes('![그림:p1|골목]'));
+  assert.ok(msg.content.includes('추가로 적은 내용')); // the concurrent addition survives
+});
+
+test('REGRESSION: regenerate orphans the image (instead of throwing away the generation) when the marker is gone', async () => {
+  const content = '[⚠️ 그림 생성 실패(오류) · "골목" · 패널에서 \'다시 그리기\'로 재시도 <pic-failed id="p1">]';
+  const msg = assistantMsg('m1', content, { lv_illust: { images: { p1: { status: 'fail', prompt: '골목', characterTags: [], summary: '골목' } } } });
+  const f = fakeApi({
+    messages: { c1: [msg] },
+    generateImpl: () => {
+      msg.content = '사용자가 마커를 지우고 완전히 새로 썼습니다.';
+      return { imageId: 'img1', imageUrl: 'https://img/1.png' };
+    },
+  });
+  const svc = createService(f.api);
+  await assert.rejects(() => svc.runFrontendRequest({ type: 'regenerate', chatId: 'c1', messageId: 'm1', imageId: 'p1' }));
+  assert.equal(msg.content, '사용자가 마커를 지우고 완전히 새로 썼습니다.'); // not reverted
+  const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
+  assert.ok(images.some((i) => i.status === 'orphan' && i.id === 'p1'));
 });

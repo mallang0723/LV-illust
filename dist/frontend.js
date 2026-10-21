@@ -82,12 +82,30 @@ export function parseTags(content) {
       });
       searchFrom = scanned.end;
     } else {
-      // Broken tag: unterminated quote, missing '=', missing closing '>', etc. Capture
-      // through the next '<' (or end of string) so the original text stays recoverable
-      // without runaway length, then keep scanning right after it.
-      let end = text.indexOf('<', idx + 4);
-      if (end === -1) end = text.length;
-      end = Math.min(end, idx + 2000);
+      // Broken tag: unterminated quote, missing '=', missing closing '>', etc.
+      //
+      // Bug found in review: capturing "through the next '<' (or end of string)" ate
+      // every character of real narrative that followed a broken tag whenever nothing
+      // else in the message started with '<' — e.g. `Before <pic prompt=bad> Important
+      // narrative…` had no second '<' anywhere, so the whole rest of the message (the
+      // narrative) was swallowed into the malformed span and then collapsed into a
+      // 200-char marker summary, destroying the story text. Fix: prefer the *nearest*
+      // '>' as the end of a broken tag attempt (that's almost always where the author
+      // meant to close it, quoting or not — see the repro above, which closes cleanly
+      // at "bad>"), only falling back to the next '<' or a small bound when no '>' is
+      // nearby, so a broken tag can never consume more than a short bounded span of
+      // text that follows it.
+      const BOUND = 300;
+      const nextLt = text.indexOf('<', idx + 4);
+      const nextGt = text.indexOf('>', idx + 4);
+      let end;
+      if (nextGt !== -1 && (nextLt === -1 || nextGt < nextLt) && nextGt - idx <= BOUND) {
+        end = nextGt + 1; // include the stray '>' — the broken tag's apparent close
+      } else if (nextLt !== -1) {
+        end = nextLt; // stop before whatever starts next (often a later real tag)
+      } else {
+        end = Math.min(idx + BOUND, text.length); // no boundary anywhere nearby: bounded cap only
+      }
       out.push({ start: idx, end, raw: text.slice(idx, end), malformed: true, charsRaw: '', promptRaw: '' });
       searchFrom = end;
     }
@@ -120,6 +138,13 @@ export function normalizeName(s) {
   return String(s ?? '').toLowerCase().replace(/\s+/g, '').trim();
 }
 
+// Lowercased/trimmed but keeping single spaces (collapsing runs of whitespace to one
+// space) — used only for the word-boundary-aware prefix fallback below, where we must
+// be able to tell "a real space follows the alias" from "more letters follow it".
+function normalizeSpaced(s) {
+  return String(s ?? '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
 /**
  * registry: [{ id, names: string[], appearance: string, enabled: boolean }, ...]
  * Builds a flat (normalizedAlias, length, characterIndex) list sorted longest-alias-first,
@@ -130,25 +155,32 @@ function flatAliases(registry) {
   (registry || []).forEach((ch, idx) => {
     for (const n of ch.names || []) {
       const norm = normalizeName(n);
-      if (norm) flat.push({ norm, idx });
+      const spaced = normalizeSpaced(n);
+      if (norm) flat.push({ norm, spaced, idx });
     }
   });
   flat.sort((a, b) => b.norm.length - a.norm.length);
   return flat;
 }
 
-/** Returns the registry index matched by `name`, or -1. Exact match, or the token
- *  starting with "<alias> " (AI appended extra words instead of using the action field). */
+/** Returns the registry index matched by `name`, or -1. Exact match (whitespace/case
+ *  insensitive), or the token beginning with "<alias> " — a real word boundary, not just
+ *  a longer prefix — for when the AI appends extra words instead of using the action
+ *  field (e.g. "아드리안 (미소)"). Review caught a bug here: comparing on the
+ *  whitespace-STRIPPED form let "Anna" match a registered alias "Ann" (no boundary at
+ *  all, just a longer string with the same prefix) — fixed by requiring an actual space
+ *  after the alias in the original (whitespace-collapsed, not stripped) text. */
 export function findCharacterIndex(name, registry) {
   const token = normalizeName(name);
   if (!token) return -1;
-  for (const { norm, idx } of flatAliases(registry)) {
+  const flat = flatAliases(registry);
+  for (const { norm, idx } of flat) {
     if (token === norm) return idx;
   }
-  // fallback: token begins with an alias (word-ish prefix on the *original* spacing,
-  // approximated by comparing the normalized prefix since normalizeName strips spaces)
-  for (const { norm, idx } of flatAliases(registry)) {
-    if (norm && token.startsWith(norm) && token.length > norm.length) return idx;
+  const spacedToken = normalizeSpaced(name);
+  const bySpacedLengthDesc = flat.slice().sort((a, b) => b.spaced.length - a.spaced.length);
+  for (const { spaced, idx } of bySpacedLengthDesc) {
+    if (spaced && spacedToken.startsWith(spaced + ' ')) return idx;
   }
   return -1;
 }
@@ -201,10 +233,6 @@ export function summarize(text, max = 40) {
   return s;
 }
 
-function escapeAttr(s) {
-  return String(s ?? '').replace(/"/g, '”');
-}
-
 /** Next image id for this message: p1, p2, … — stable/deterministic given how many
  *  ids already exist (so re-processing new tags on an edited message doesn't collide
  *  with ids already used by previously rendered images). */
@@ -219,16 +247,31 @@ export function renderSuccessMarker(id, imageUrl, summaryText) {
   return `![그림:${id}|${summarize(summaryText)}](${imageUrl})`;
 }
 
+// Keeps the human-readable summary free of characters that could ever confuse a regex
+// that looks for the fixed `<pic-failed id="...">` / `<pic-skipped id="...">` sentinel
+// that follows it (review finding: the previous design embedded the raw chars/prompt
+// attribute text straight into the sentinel tag, and since a tag's `prompt="..."` value
+// is allowed to contain a literal '>' — see scanTag, which only disallows '<' and '"'
+// inside a value, not '>' — a prompt containing '>' would make the old
+// `<pic-failed[^>]*>`-style regexes stop too early, breaking regenerate's replace AND
+// the history strip-down). Fix: the sentinel tag now carries *only* an opaque id — all
+// recoverable structured data (prompt/characterTags) lives in message metadata, which
+// is where regenerate already reads it from — so the regex matching it can be a fixed,
+// unambiguous string with no wildcard anywhere near a quote.
+function markerSafeSummary(text) {
+  return summarize(text, 60).replace(/"/g, '”').replace(/[<>]/g, '');
+}
+
 export function renderFailureMarker(id, tag, reason) {
-  const chars = tag.charsRaw ? ` chars="${escapeAttr(tag.charsRaw)}"` : '';
-  const prompt = tag.promptRaw ? ` prompt="${escapeAttr(tag.promptRaw)}"` : '';
-  return `[⚠️ 그림 생성 실패(${reason || '오류'}) · 패널에서 '다시 그리기'로 재시도 <pic-failed id="${id}"${chars}${prompt}>]`;
+  const summary = markerSafeSummary(tag.promptRaw || tag.charsRaw || tag.raw);
+  const shown = summary ? ` · "${summary}"` : '';
+  return `[⚠️ 그림 생성 실패(${reason || '오류'})${shown} · 패널에서 '다시 그리기'로 재시도 <pic-failed id="${id}">]`;
 }
 
 export function renderSkippedMarker(id, tag) {
-  const chars = tag.charsRaw ? ` chars="${escapeAttr(tag.charsRaw)}"` : '';
-  const prompt = tag.promptRaw ? ` prompt="${escapeAttr(tag.promptRaw)}"` : '';
-  return `[한 답변당 그림 상한(2장)을 넘어 건너뜀 · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}"${chars}${prompt}>]`;
+  const summary = markerSafeSummary(tag.promptRaw || tag.charsRaw || tag.raw);
+  const shown = summary ? ` · "${summary}"` : '';
+  return `[한 답변당 그림 상한(2장)을 넘어 건너뜀${shown} · 패널에서 '다시 그리기'로 추가 생성 가능 <pic-skipped id="${id}">]`;
 }
 
 export function renderMalformedMarker(tag) {
@@ -295,8 +338,11 @@ export function applyMarkers(content, tags, replacements) {
 // ---------------------------------------------------------------- history placeholder rewrite
 
 const RENDERED_IMG_RE = /!\[그림:[a-z0-9]+\|([^\]]*)\]\([^)]*\)/g;
-const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed[^>]*>\]/g;
-const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped[^>]*>\]/g;
+// Anchored on the fixed `<pic-failed id="...">` / `<pic-skipped id="...">` tail (no
+// chars/prompt attributes any more — see renderFailureMarker/renderSkippedMarker), so
+// there's no wildcard adjacent to a quote that a prompt containing '>' could break.
+const FAILED_RE = /\[⚠️ 그림 생성 실패\([^)]*\)[^[\]]*<pic-failed id="[a-z0-9]+">\]/g;
+const SKIPPED_RE = /\[한 답변당 그림 상한\(2장\)을 넘어 건너뜀[^[\]]*<pic-skipped id="[a-z0-9]+">\]/g;
 const MALFORMED_RE = /\[그림 태그 형식 오류 — 원본: ([^\]]*)\]/g;
 
 /** For prompt assembly over past turns: collapse any of our rendered/failure/skip/
@@ -318,6 +364,24 @@ export function hasLiveTags(content) {
   return parseTags(content).length > 0;
 }
 
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Regex matching the ONE marker occurrence for a given image id — either its rendered
+ *  image, or its failed/skipped sentinel — for regenerate's in-place replace. Exported
+ *  so backend.mjs doesn't hand-roll its own copy of this pattern (review finding: the
+ *  old inline version in backend.mjs used a `[^>]*`-style wildcard next to an attribute
+ *  value that could itself contain '>', which could fail to match and silently leave
+ *  the stale marker in place while still reporting success). Single source of truth. */
+export function markerRegexForId(id) {
+  const idRe = escapeRegExp(id);
+  return new RegExp(
+    `!\\[그림:${idRe}\\|[^\\]]*\\]\\([^)]*\\)` +
+    `|\\[[^[\\]]*<pic-(?:failed|skipped) id="${idRe}">\\]`,
+  );
+}
+
 // ---------------------------------------------------------------- F1 instruction injection
 
 export const DEFAULT_SETTINGS = {
@@ -336,17 +400,35 @@ export function normalizeSettings(raw) {
   return s;
 }
 
+// Strips newlines/control characters and caps length before an alias is ever quoted
+// into the system/user/assistant-role instruction message — review flagged that aliases
+// (typed by the user into the registry panel, F4) went into that message verbatim, so a
+// stray pasted newline (or a block of text someone fat-fingered into the name field)
+// could inject extra lines into the instruction. Single-user tool, so this isn't an
+// external-attacker threat model, but it's cheap, correct hygiene regardless.
+function sanitizeAliasForInstruction(name) {
+  return String(name ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ') // control chars incl. newlines -> space
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
 /** Enabled characters' alias lists, for the AI instruction (§2: list registered
  *  names so the AI uses them verbatim, any alias accepted regardless of chat language). */
 export function instructionNameList(registry) {
   return (registry || []).filter((c) => c.enabled && c.names?.length)
-    .map((c) => c.names.filter(Boolean).join(' / '));
+    .map((c) => c.names.map(sanitizeAliasForInstruction).filter(Boolean).map((n) => `"${n}"`).join(' / '))
+    .filter(Boolean);
 }
 
 export function buildInstructionText(registry) {
   const names = instructionNameList(registry);
+  // Roster lines are presented as quoted data (each alias wrapped in literal quotes),
+  // not as free-form instruction text, so a sanitized-but-still-plain-looking alias
+  // can't be read as part of the instruction's own sentence structure.
   const roster = names.length
-    ? `\n등장인물 목록(아무 별칭이나 그대로 사용 가능):\n- ${names.join('\n- ')}`
+    ? `\n등장인물 목록(따옴표 안 글자 그대로 사용 가능, 아무 별칭이나 써도 됨):\n- ${names.join('\n- ')}`
     : '';
   return (
     '그림이 필요한 장면에서는 답변 중간에 다음 형식의 태그를 한 번 써라(최대 2개): ' +
@@ -434,8 +516,18 @@ function el(tag, attrs = {}, ...kids) {
 
 export function setup(ctx) {
   let alive = true, modal = null, chatId = null, characterId = null, seq = 0;
+  // Review finding 4: a late response from a SUPERSEDED load (e.g. the user closed the
+  // panel and reopened it for a different card before the first load finished) used to
+  // land in `view` regardless, so card A's registry could flash over — or silently
+  // replace — card B's. `loadToken` fixes that: every open() mints a new token, and
+  // loadAll() only commits its results if its own token is still the current one.
+  let loadToken = 0;
   const pending = new Map();
-  const view = { settings: null, registry: [], auto: true, images: [], status: '', kind: '', busy: false };
+  // view.chatId/characterId are the SNAPSHOT this panel's data actually belongs to
+  // (captured once per open(), not the live, possibly-already-moved-on outer
+  // chatId/characterId vars) — every write (save/toggle/regenerate) targets these, not
+  // whatever card happens to be active by the time the write fires.
+  const view = { settings: null, registry: [], auto: true, images: [], status: '', kind: '', busy: false, ready: false, chatId: null, characterId: null };
 
   const action = ctx.ui.registerInputBarAction({ id: 'lv-illust', label: '삽화가 설정', iconSvg: ICON, enabled: false });
 
@@ -463,26 +555,30 @@ export function setup(ctx) {
 
   function setStatus(text, kind = '') { view.status = text; view.kind = kind; const s = modal?.root.querySelector('.lvil-status'); if (s) { s.textContent = text; s.dataset.kind = kind; } }
 
-  async function loadAll() {
-    setStatus('불러오는 중…');
+  async function loadAll(token, snapChatId, snapCharacterId) {
     const [s, r, a, i] = await Promise.all([
       request({ type: 'load_settings' }),
-      characterId ? request({ type: 'load_registry', characterId }) : Promise.resolve({ ok: true, registry: [] }),
-      request({ type: 'load_auto', chatId }),
-      request({ type: 'list_images', chatId }),
+      snapCharacterId ? request({ type: 'load_registry', characterId: snapCharacterId }) : Promise.resolve({ ok: true, registry: [] }),
+      request({ type: 'load_auto', chatId: snapChatId }),
+      request({ type: 'list_images', chatId: snapChatId }),
     ]);
-    if (!alive) return;
+    if (!alive || token !== loadToken) return; // superseded by a newer open() — discard
+    const allOk = s.ok && r.ok && a.ok && i.ok;
     if (s.ok) view.settings = s.settings;
     if (r.ok) view.registry = r.registry;
     if (a.ok) view.auto = a.auto;
     if (i.ok) view.images = i.images;
-    setStatus('');
+    view.ready = allOk;
+    setStatus(allOk ? '' : (s.error || r.error || a.error || i.error || '일부 정보를 불러오지 못했습니다'), allOk ? '' : 'err');
     render();
   }
 
   async function saveSettings(patch) {
+    if (!view.ready || view.busy) return;
+    const token = loadToken;
     view.busy = true; render();
     const r = await request({ type: 'save_settings', settings: { ...view.settings, ...patch } });
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) view.settings = r.settings;
     render();
@@ -490,30 +586,51 @@ export function setup(ctx) {
   }
 
   async function toggleAuto() {
+    if (!view.ready || view.busy) return;
+    const token = loadToken, targetChatId = view.chatId;
     view.busy = true; render();
-    const r = await request({ type: 'set_auto', chatId, on: !view.auto });
+    const r = await request({ type: 'set_auto', chatId: targetChatId, on: !view.auto });
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) view.auto = r.auto;
     render();
   }
 
   async function saveRegistry(next) {
-    if (!characterId) return;
+    if (!view.ready || view.busy || !view.characterId) return;
+    const token = loadToken, targetCharacterId = view.characterId;
     view.busy = true; render();
-    const r = await request({ type: 'save_registry', characterId, registry: next });
+    const r = await request({ type: 'save_registry', characterId: targetCharacterId, registry: next });
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) view.registry = r.registry;
     render();
     setStatus(r.ok ? '등록부 저장됨' : (r.error || '실패'), r.ok ? 'ok' : 'err');
   }
 
+  function addDraftCharacter() {
+    // Review finding 3: this used to call saveRegistry() immediately with a brand-new
+    // {names: [], ...} entry — but normalizeRegistry() (core.mjs) correctly drops any
+    // entry with no names (an unnamed character can't ever be matched against), so the
+    // "+ 인물 추가" button silently did nothing, and starting from an empty registry
+    // there was no way to ever add a first character. Fix: the new row is purely local
+    // view state until its own "저장" button is clicked with a non-empty name — it is
+    // never round-tripped through save_registry (and thus never dropped) before that.
+    if (!view.ready || view.busy) return;
+    view.registry = [...view.registry, { names: [], appearance: '', enabled: true }];
+    render();
+  }
+
   async function regenerate(imageId, messageId) {
+    if (!view.ready || view.busy) return;
+    const token = loadToken, targetChatId = view.chatId;
     view.busy = true; render();
-    const r = await request({ type: 'regenerate', chatId, messageId, imageId }, 60000);
+    const r = await request({ type: 'regenerate', chatId: targetChatId, messageId, imageId }, 60000);
+    if (!alive || token !== loadToken) return;
     view.busy = false;
     if (r.ok) {
-      const i = await request({ type: 'list_images', chatId });
-      if (i.ok) view.images = i.images;
+      const i = await request({ type: 'list_images', chatId: targetChatId });
+      if (alive && token === loadToken && i.ok) view.images = i.images;
     }
     render();
     setStatus(r.ok ? '다시 그렸습니다' : (r.error || '실패'), r.ok ? 'ok' : 'err');
@@ -521,13 +638,14 @@ export function setup(ctx) {
 
   function settingsSection() {
     const s = view.settings || {};
-    const posSel = el('select', { on: { change: (e) => saveSettings({ position: e.target.value }) } },
+    const dis = view.busy || !view.ready;
+    const posSel = el('select', { disabled: dis, on: { change: (e) => saveSettings({ position: e.target.value }) } },
       ['start', 'end', 'depth'].map((p) => el('option', { value: p, selected: s.position === p, text: p === 'start' ? '맨 앞' : p === 'end' ? '맨 끝' : '깊이(최근 N번째 앞)' })));
-    const depthInput = el('input', { type: 'text', inputmode: 'numeric', value: String(s.depth ?? 4), disabled: s.position !== 'depth',
+    const depthInput = el('input', { type: 'text', inputmode: 'numeric', value: String(s.depth ?? 4), disabled: dis || s.position !== 'depth',
       on: { change: (e) => { const n = parseInt(e.target.value, 10); if (Number.isInteger(n) && n >= 0) saveSettings({ depth: n }); } } });
-    const roleSel = el('select', { on: { change: (e) => saveSettings({ role: e.target.value }) } },
+    const roleSel = el('select', { disabled: dis, on: { change: (e) => saveSettings({ role: e.target.value }) } },
       ['system', 'user', 'assistant'].map((r) => el('option', { value: r, selected: s.role === r, text: r })));
-    const maxSel = el('select', { on: { change: (e) => saveSettings({ maxImages: parseInt(e.target.value, 10) }) } },
+    const maxSel = el('select', { disabled: dis, on: { change: (e) => saveSettings({ maxImages: parseInt(e.target.value, 10) }) } },
       [1, 2].map((n) => el('option', { value: String(n), selected: s.maxImages === n, text: n + '장' })));
     return el('section', {},
       el('h4', { text: '⚙️ 설정 (계정 전체)' }),
@@ -535,7 +653,7 @@ export function setup(ctx) {
       el('div', { class: 'lvil-row' }, el('span', {}, '지시 역할'), roleSel),
       el('div', { class: 'lvil-row' }, el('span', {}, '답변당 최대 그림'), maxSel),
       el('div', { class: 'lvil-note', text: '이 채팅 자동 생성:' },
-        el('button', { type: 'button', 'data-active': String(view.auto), disabled: view.busy, text: view.auto ? '켜짐 (끄기)' : '꺼짐 (켜기)',
+        el('button', { type: 'button', 'data-active': String(view.auto), disabled: view.busy || !view.ready, text: view.auto ? '켜짐 (끄기)' : '꺼짐 (켜기)',
           on: { click: toggleAuto } })));
   }
 
@@ -543,15 +661,16 @@ export function setup(ctx) {
     const namesInput = el('input', { type: 'text', value: ch.names.join(', '), placeholder: '이름/별칭 (쉼표로 구분)' });
     const appearanceInput = el('textarea', { placeholder: '외형 프롬프트 (NAI 태그)' });
     appearanceInput.value = ch.appearance;
-    const enabledBtn = el('button', { type: 'button', 'data-active': String(ch.enabled), text: ch.enabled ? '켜짐' : '꺼짐',
+    const dis = view.busy || !view.ready;
+    const enabledBtn = el('button', { type: 'button', 'data-active': String(ch.enabled), disabled: dis, text: ch.enabled ? '켜짐' : '꺼짐',
       on: { click: () => { list[idx] = { ...ch, enabled: !ch.enabled }; saveRegistry(list); } } });
-    const saveBtn = el('button', { type: 'button', text: '저장', on: { click: () => {
+    const saveBtn = el('button', { type: 'button', disabled: dis, text: '저장', on: { click: () => {
       const names = namesInput.value.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
       if (!names.length) { setStatus('이름을 한 개 이상 입력해 주세요', 'err'); return; }
       list[idx] = { ...ch, names, appearance: appearanceInput.value };
       saveRegistry(list);
     } } });
-    const delBtn = el('button', { type: 'button', text: '삭제', on: { click: () => {
+    const delBtn = el('button', { type: 'button', disabled: dis, text: '삭제', on: { click: () => {
       const next = list.slice(0, idx).concat(list.slice(idx + 1));
       saveRegistry(next);
     } } });
@@ -559,12 +678,10 @@ export function setup(ctx) {
   }
 
   function registrySection() {
-    if (!characterId) return el('section', {}, el('h4', { text: '👤 인물 외형 등록부' }), el('div', { class: 'lvil-note', text: '캐릭터 카드를 연 채팅에서만 편집할 수 있습니다.' }));
+    if (!view.characterId) return el('section', {}, el('h4', { text: '👤 인물 외형 등록부' }), el('div', { class: 'lvil-note', text: '캐릭터 카드를 연 채팅에서만 편집할 수 있습니다.' }));
     const list = view.registry.slice();
     const rows = list.map((ch, i) => charRow(ch, i, list));
-    const addBtn = el('button', { type: 'button', text: '+ 인물 추가', on: { click: () => {
-      saveRegistry([...list, { names: [], appearance: '', enabled: true }]);
-    } } });
+    const addBtn = el('button', { type: 'button', text: '+ 인물 추가', disabled: !view.ready || view.busy, on: { click: addDraftCharacter } });
     return el('section', {}, el('h4', { text: '👤 인물 외형 등록부 (이 카드의 모든 채팅과 공유)' }), ...rows, addBtn,
       el('div', { class: 'lvil-note', text: '등록부는 비어서 시작합니다. 여기서 추가한 인물만 이름 매칭에 쓰입니다.' }));
   }
@@ -577,7 +694,7 @@ export function setup(ctx) {
     const rows = view.images.map((img) => el('div', { class: 'lvil-img' },
       el('img', { src: img.imageUrl || '', alt: '' }),
       el('div', { class: 'sum', text: img.summary || img.id }),
-      el('button', { type: 'button', disabled: view.busy, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
+      el('button', { type: 'button', disabled: view.busy || !view.ready, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
     return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }), ...rows);
   }
 
@@ -596,8 +713,17 @@ export function setup(ctx) {
     try { modal = ctx.ui.showModal({ title: '삽화가 (개인용)', width: 480, maxHeight: 720 }); } catch { return; }
     modal.root.style.overflowY = 'auto';
     modal.onDismiss(() => { modal = null; });
+    // Snapshot which card/chat this panel instance belongs to, and bump the load token
+    // BEFORE clearing view state, so any in-flight loadAll() from a previous open() is
+    // immediately recognized as stale once it resolves (review finding 4).
+    const token = ++loadToken;
+    const snapChatId = chatId, snapCharacterId = characterId;
+    Object.assign(view, {
+      settings: null, registry: [], auto: true, images: [], ready: false, busy: false,
+      chatId: snapChatId, characterId: snapCharacterId, status: '불러오는 중…', kind: '',
+    });
     render();
-    await loadAll();
+    await loadAll(token, snapChatId, snapCharacterId);
   }
 
   const offClick = action.onClick(() => { open(); });

@@ -13,6 +13,21 @@ reasonable reading of verified material, not contradicted by anything found, but
 executed. **UNVERIFIED** = genuinely untested against the live host; call this out to
 the user before relying on it in production.
 
+## Manifest validity (packaging)
+
+Read `manager.service.ts` `readManifest`/`readManifestFromPath` (~709-767) and
+`url-safety.ts` `normalizeSpindleHttpsUrl` (~11-36) read-only via `docker exec`, copies
+kept at `.review/host/` (gitignored). The host requires `identifier` (matching
+`/^[a-z][a-z0-9_]*$/`), `version`, `name`, `author`; `github`/`homepage` are validated
+*only if non-empty* (`normalizeSpindleHttpsUrl` returns `""` and does not throw when the
+field is blank and `required` wasn't passed — which is exactly how `readManifest`, the
+path used for **Import Local**, calls it). Our `spindle.json` has `identifier: "lv_illust"`
+(valid), `version`/`name`/`author` set, and `github: ""` — all **VERIFIED** valid for
+Import Local without any changes. For GitHub "Install from Source", a different code path
+(`manager.service.ts` ~1382) fills `github` from the pasted install URL when the
+manifest's own field is empty, so no manifest edit is needed for that path either —
+**VERIFIED** reading that line, not exercised against a live install.
+
 ## Permissions actually required
 
 | Permission | Why | Evidence |
@@ -162,6 +177,73 @@ independently re-derived from the installer's permission-check code.
   important thing to check in the "first task before building" sense that DESIGN.md §6
   asked for, and it could not be fully closed from source alone — it needs one real
   generation with a `<pic>` tag to see what actually renders.**
+
+## Independent review (Codex) findings — verified against this code, then fixed
+
+A second, independent review pass (Codex) found 7 issues against the committed code.
+Each was checked against the actual source (not taken on faith) before fixing:
+
+1. **BLOCKER, confirmed real.** `processMessage`/`regenerate` read the message once,
+   awaited `imageGen.generate` (can take seconds), then wrote content/metadata computed
+   from that stale snapshot — silently reverting a concurrent edit/swipe or another
+   extension's metadata write. Fixed: both paths now re-fetch the live message
+   immediately before writing, locate each tag by its own verbatim raw text in the
+   *current* content (not a stored offset), and refuse to touch the message at all if its
+   active swipe changed underneath them — the generated image is kept instead as an
+   "orphan" (`lv_illust.orphans` chat variable) visible read-only via `list_images`.
+   Regression tests: `test/backend.test.mjs` "REGRESSION: a user edit made DURING
+   generation…", "…swipe navigated away…", "…concurrent metadata write…", and two
+   `regenerate`-specific ones.
+2. **BLOCKER, confirmed real.** The malformed-tag fallback in `parseTags` captured text
+   "through the next `<` or end of string" — when a broken tag had no `>` and nothing
+   else in the message started with `<`, the *entire rest of the message* (including all
+   following narrative) was swallowed into the malformed span and collapsed to a 200-char
+   summary. Fixed: prefer the nearest `>` (almost always the broken tag's own intended
+   close) as the boundary, bounded to 300 chars from the tag's start in the worst case —
+   narrative text outside that bound is never touched. See `test/core.test.mjs`
+   "REGRESSION (review finding 2)" (reproduces the exact repro given in review).
+3. **MAJOR, confirmed real.** "+ 인물 추가" called `saveRegistry()` immediately with a
+   `{names: [], ...}` entry, which `normalizeRegistry()` (correctly) drops — so starting
+   from the required-empty registry, the button did nothing and no character could ever
+   be added through the UI. Fixed: the new row is now purely local view state until its
+   own "저장" is clicked with a non-empty name.
+4. **MAJOR, confirmed real.** `view` (settings/registry/images) was written by whichever
+   `loadAll()` happened to resolve last, with no way to tell a superseded load (e.g. the
+   panel was closed and reopened for a different card before the first load answered)
+   from the current one — stale data could flash over, or silently replace, a different
+   card's. Fixed: a monotonic `loadToken` bumped on every `open()`; a load's results are
+   discarded if the token no longer matches by the time it resolves. Writes are also now
+   gated on `view.ready` (only true once a load for the *current* token fully succeeds),
+   and every write targets `view.chatId`/`view.characterId` (the snapshot a given panel
+   instance was opened for) rather than the live, possibly-already-moved-on outer
+   `chatId`/`characterId`.
+5. **MINOR, confirmed real.** The alias-matching "prefix" fallback (for an AI appending
+   extra words to a name instead of using the action field) compared on the
+   whitespace-*stripped* form, so "Anna" matched a registered alias "Ann" — not a real
+   word boundary, just a longer string sharing the same prefix. Fixed: the fallback now
+   requires an actual space after the alias in the original (whitespace-collapsed, not
+   stripped) text.
+6. **MINOR, confirmed real.** Failure/skipped sentinel tags embedded the raw `chars`/
+   `prompt` attribute text (`<pic-failed id="..." chars="..." prompt="...">`), and since
+   `scanTag` only disallows `<`/`"` inside an attribute value — not `>` — a prompt
+   containing a literal `>` could make the `[^>]*`-style regexes (in both `core.mjs`'s
+   history-strip and `backend.mjs`'s regenerate replace) stop too early: regenerate could
+   report success while the stale marker stayed in the message, and history cleanup could
+   leave raw tag text in what gets sent to the model. Fixed: the sentinel now carries only
+   an opaque `id` (structured data already lives in metadata, which is where regenerate
+   actually read it from anyway); matching uses one shared, exported regex builder
+   (`markerRegexForId`) with no wildcard anywhere near a quote. `regenerate` now also
+   checks that the replace actually matched before reporting success.
+7. **MINOR, confirmed real, low severity for this threat model.** Aliases (typed by the
+   user into the F4 registry panel) were spliced verbatim into the system/user/assistant
+   instruction message — a stray pasted newline could inject an extra line. Not an
+   external-attacker risk for a single-user tool, but cheap to fix regardless: aliases are
+   sanitized (control chars/newlines stripped, length-capped) before being presented, and
+   the roster now shows them as quoted data (`"이름"`) rather than bare instruction text.
+
+No findings were rejected — all 7 were real bugs against this codebase, each with its own
+regression test (`REGRESSION (review finding N)` in `test/core.test.mjs`, `REGRESSION …`
+in `test/backend.test.mjs` and `test/frontend.test.mjs`).
 
 ## What was explicitly NOT done (by design, not oversight)
 
