@@ -1,11 +1,11 @@
 {
   "version": "0.1.0",
-  "name": "LV-AutoPic (개인용)",
-  "identifier": "lv_autopic",
+  "name": "삽화가 (개인용)",
+  "identifier": "lv_illust",
   "author": "mallang0723",
   "github": "",
   "description": "개인용 · 답변 속 <pic> 태그 자리에 NovelAI 그림을 넣고, 인물별 외형을 이름으로 찾아 캐릭터 프롬프트 칸에 넣는다 (비공개, 배포 금지)",
-  "permissions": ["image_gen", "interceptor", "chat_mutation", "characters", "chats"],
+  "permissions": ["image_gen", "interceptor", "chat_mutation", "characters", "chats", "generation"],
   "entry_backend": "dist/backend.js",
   "entry_frontend": "dist/frontend.js"
 }

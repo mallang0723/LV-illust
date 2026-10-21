@@ -1,4 +1,4 @@
-// LV-AutoPic — shared pure logic (backend + frontend). No host API calls in this file.
+// 삽화가 (개인용) / LV-Illust — shared pure logic (backend + frontend). No host API calls in this file.
 //
 // Tag format (docs/DESIGN.md §3):
 //   <pic chars="아드리안, 정수빈" prompt="장면 묘사 태그들">
@@ -6,7 +6,7 @@
 // `chars` is optional (scene-only picture); `prompt` is required — a tag with neither
 // a valid `chars=".."` / `prompt=".."` pair is malformed and never silently dropped.
 
-export const IDENTIFIER = 'lv_autopic';
+export const IDENTIFIER = 'lv_illust';
 
 // ---------------------------------------------------------------- tag parsing
 
@@ -231,7 +231,11 @@ export function renderSkippedMarker(id, tag) {
 }
 
 export function renderMalformedMarker(tag) {
-  return `[그림 태그 형식 오류 — 원본: ${summarize(tag.raw, 200)}]`;
+  // Escape '<' (and the brackets summarize() already strips) so this marker can never
+  // be re-discovered as a `<pic ...>` tag on the next pass (parseTags / handleMessageEdited
+  // would otherwise re-wrap it every time the message is saved, growing without bound).
+  const safe = summarize(tag.raw, 200).replace(/</g, '＜');
+  return `[그림 태그 형식 오류 — 원본: ${safe}]`;
 }
 
 // ---------------------------------------------------------------- planning (F2)

@@ -51,7 +51,7 @@ function harness({ reply, characterId = 'ch1' } = {}) {
   return {
     frames, stop,
     async open() { await flush(); onClick(); await flush(); return modal; },
-    status: () => modal.root.querySelector('.lvap-status').textContent,
+    status: () => modal.root.querySelector('.lvil-status').textContent,
   };
 }
 

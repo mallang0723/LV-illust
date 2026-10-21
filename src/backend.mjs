@@ -1,4 +1,4 @@
-// LV-AutoPic backend worker.
+// 삽화가 (개인용) / LV-Illust backend worker.
 //
 // Owns every host-side effect: reading/writing the per-character registry
 // (spindle.characters, permission "characters"), the per-user settings and
@@ -17,7 +17,7 @@ import {
 } from './core.mjs';
 
 const SETTINGS_PATH = 'settings.json';
-const AUTO_VAR_KEY = 'lv_autopic.auto';
+const AUTO_VAR_KEY = 'lv_illust.auto';
 
 function extToRegistry(character) {
   return normalizeRegistry(character?.extensions?.[IDENTIFIER]);
@@ -74,17 +74,31 @@ async function saveRegistry(api, characterId, registry) {
 }
 
 function existingImageIds(messages) {
-  // Scan rendered-image ids already present across the chat so new ids never collide,
-  // even across different messages (ids only need to be unique within a message, but
-  // keeping them globally distinct makes debugging/metadata lookups simpler).
+  // Scan rendered-image ids already present (from content AND from metadata — a swipe's
+  // *other* slot content isn't scanned, but its metadata.images keys still are, so a new
+  // id never collides with and overwrites a different swipe's stored record) so new ids
+  // never collide across the chat.
   const ids = [];
   const re = /!\[그림:([a-z0-9]+)\|/g;
   for (const m of messages || []) {
     let mm;
     re.lastIndex = 0;
     while ((mm = re.exec(m?.content || ''))) ids.push(mm[1]);
+    const metaIds = m?.metadata?.[IDENTIFIER]?.images;
+    if (metaIds) ids.push(...Object.keys(metaIds));
   }
   return ids;
+}
+
+// Serializes every spindle.imageGen.generate() call behind one promise chain, across
+// concurrent GENERATION_ENDED/MESSAGE_EDITED handlers and panel regenerate requests
+// alike — SharedNAI only has one generation slot (design §4 "동시 생성 1개").
+let generateQueue = Promise.resolve();
+function queuedGenerate(api, input) {
+  const run = () => api.imageGen.generate(input);
+  const result = generateQueue.then(run, run);
+  generateQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 /** Merge our namespaced key into a message's existing metadata bag without clobbering
@@ -114,7 +128,7 @@ async function processMessage(api, { chatId, message, registry, settings }) {
 
   for (const job of jobs) {
     try {
-      const result = await api.imageGen.generate({
+      const result = await queuedGenerate(api, {
         prompt: job.prompt,
         parameters: { characterTags: job.characterTags },
         owner_chat_id: chatId,
@@ -157,9 +171,17 @@ export function createService(api) {
   }
 
   async function handleMessageEdited(payload) {
-    const message = payload?.message;
+    // MESSAGE_EDITED's payload shape is UNVERIFIED (see docs/API-NOTES.md) — only
+    // `chatId` and `message.id` are trusted from it. Everything else (content,
+    // metadata, is_user) is re-read through the normalized `getMessages` shape, so a
+    // wrong guess about the raw payload's fields can't silently clobber another
+    // extension's metadata or act on stale content.
     const chatId = payload?.chatId;
-    if (!message || !chatId || message.is_user) return;
+    const messageId = payload?.message?.id;
+    if (!chatId || !messageId) return;
+    const messages = await api.chat.getMessages(chatId);
+    const message = messages.find((m) => m.id === messageId);
+    if (!message || message.role !== 'assistant') return;
     const settings = await readSettings(api);
     if (!(await isAutoOn(api, chatId, true))) return;
     const characterId = await characterIdForChat(api, chatId);
@@ -175,7 +197,11 @@ export function createService(api) {
       const auto = await isAutoOn(api, context.chatId, true);
       if (!auto) return messages;
       const withInstruction = injectInstruction(messages, settings, registry);
-      return withInstruction.map((m) => ({ ...m, content: stripRenderedImages(m.content) }));
+      // content can be a string OR LlmMessagePartDTO[] (multimodal turns) — only rewrite
+      // string content; stripRenderedImages(array) would stringify to "[object Object]".
+      return withInstruction.map((m) => (
+        typeof m.content === 'string' ? { ...m, content: stripRenderedImages(m.content) } : m
+      ));
     });
   }
 
@@ -215,7 +241,7 @@ export function createService(api) {
         const rec = message.metadata?.[IDENTIFIER]?.images?.[payload.imageId];
         if (!rec) throw new Error('다시 그릴 정보를 찾을 수 없습니다');
         try {
-          const result = await api.imageGen.generate({
+          const result = await queuedGenerate(api, {
             prompt: rec.prompt, parameters: { characterTags: rec.characterTags },
             owner_chat_id: payload.chatId, includeDataUrl: false,
           });
@@ -249,8 +275,8 @@ export function createService(api) {
 export function start(api) {
   const service = createService(api);
   const offs = [];
-  offs.push(api.on('GENERATION_ENDED', (payload) => { service.handleGenerationEnded(payload).catch((e) => console.error('[lv_autopic]', e)); }));
-  offs.push(api.on('MESSAGE_EDITED', (payload) => { service.handleMessageEdited(payload).catch((e) => console.error('[lv_autopic]', e)); }));
+  offs.push(api.on('GENERATION_ENDED', (payload) => { service.handleGenerationEnded(payload).catch((e) => console.error('[lv_illust]', e)); }));
+  offs.push(api.on('MESSAGE_EDITED', (payload) => { service.handleMessageEdited(payload).catch((e) => console.error('[lv_illust]', e)); }));
   offs.push(service.registerInterceptor());
   offs.push(api.onFrontendMessage(async (payload, userId, frontendSessionId) => {
     if (!payload || typeof payload.requestId !== 'string') return;

@@ -63,11 +63,19 @@ test('parseTags: no tags returns empty array', () => {
 
 test('parseTags: rendered/failed/skipped/malformed markers never re-match (idempotency)', () => {
   const rendered = '![그림:p1|골목 장면](https://example/img.png)';
-  const failed = '[⚠️ 그림 생성 실패(연결 오류) · 패널에서 \'다시 그리기\'로 재시도 <pic-failed chars="a" prompt="b">]';
-  const skipped = '[한 답변당 그림 상한(2장)을 넘어 건너뜀 · 패널에서 \'다시 그리기\'로 추가 생성 가능 <pic-skipped chars="a" prompt="b">]';
-  for (const s of [rendered, failed, skipped]) {
+  const failed = C.renderFailureMarker('p1', { charsRaw: 'a', promptRaw: 'b' }, '연결 오류');
+  const skipped = C.renderSkippedMarker('p2', { charsRaw: 'a', promptRaw: 'b' });
+  const malformed = C.renderMalformedMarker({ raw: '<pic foo="bar">' });
+  const malformedUnterminated = C.renderMalformedMarker({ raw: '<pic chars="broken, no closing quote' });
+  for (const s of [rendered, failed, skipped, malformed, malformedUnterminated]) {
     assert.deepEqual(C.parseTags(s), [], s);
   }
+});
+
+test('renderMalformedMarker: never embeds a literal "<" (would re-match as a live tag on the next pass)', () => {
+  const marker = C.renderMalformedMarker({ raw: '<pic foo="bar">' });
+  assert.ok(!marker.includes('<'));
+  assert.ok(marker.includes('＜pic'));
 });
 
 // ---------------------------------------------------------------- splitChars

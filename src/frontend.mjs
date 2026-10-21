@@ -1,34 +1,34 @@
 import { normalizeSettings, normalizeRegistry, IDENTIFIER } from './core.mjs';
 
-// Frontend: input-bar action "LV-AutoPic 설정" -> host modal with settings (user-wide),
+// Frontend: input-bar action "삽화가 설정" -> host modal with settings (user-wide),
 // the current card's registry (card-wide), the current chat's auto-gen toggle, and a
 // list of this chat's generated images with a "다시 그리기" button each (F6).
 // Free APIs only: registerInputBarAction, showModal, getActiveChat, events.on,
 // state.subscribe. All writes go through the backend worker (sendToBackend/onBackendMessage).
 
 const CSS = `
-.lvap{--fg:var(--lumiverse-text,#e8e6ef);--dim:var(--lumiverse-text-muted,#9b98a8);--line:var(--lumiverse-border,rgba(127,127,127,.28));
+.lvil{--fg:var(--lumiverse-text,#e8e6ef);--dim:var(--lumiverse-text-muted,#9b98a8);--line:var(--lumiverse-border,rgba(127,127,127,.28));
 --fill:var(--lumiverse-fill-subtle,rgba(127,127,127,.10));--acc:var(--lumiverse-primary,#ff836e);
 color:var(--fg);font-size:14px;line-height:1.4;display:flex;flex-direction:column;gap:10px;padding:2px 0 8px;box-sizing:border-box}
-.lvap *{box-sizing:border-box}
-.lvap-status{font-size:12.5px;color:var(--dim);min-height:1.2em}
-.lvap-status[data-kind=err]{color:var(--lumiverse-danger,#ef4444)}
-.lvap-status[data-kind=ok]{color:var(--acc)}
-.lvap section{border:1px solid var(--line);border-radius:10px;background:var(--fill);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
-.lvap h4{margin:0;font-size:13px;color:var(--dim)}
-.lvap-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.lvap button{font:inherit;font-size:13px;color:var(--fg);background:transparent;border:1px solid var(--line);border-radius:8px;padding:6px 11px;min-height:32px;cursor:pointer}
-.lvap button:hover:not(:disabled){border-color:var(--acc)}
-.lvap button:disabled{opacity:.5;cursor:default}
-.lvap button[data-active=true]{border-color:var(--acc);font-weight:600}
-.lvap input[type=text],.lvap textarea,.lvap select{font:inherit;font-size:14px;color:var(--fg);background:var(--lumiverse-fill,rgba(0,0,0,.15));border:1px solid var(--line);border-radius:8px;padding:6px 8px;width:100%}
-.lvap textarea{min-height:48px;resize:vertical}
-.lvap-char{border-top:1px dashed var(--line);padding-top:8px;display:flex;flex-direction:column;gap:4px}
-.lvap-note{font-size:12px;color:var(--dim)}
-.lvap-imglist{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
-.lvap-img{display:flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;padding:6px}
-.lvap-img img{width:48px;height:48px;object-fit:cover;border-radius:6px;background:#0003}
-.lvap-img .sum{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
+.lvil *{box-sizing:border-box}
+.lvil-status{font-size:12.5px;color:var(--dim);min-height:1.2em}
+.lvil-status[data-kind=err]{color:var(--lumiverse-danger,#ef4444)}
+.lvil-status[data-kind=ok]{color:var(--acc)}
+.lvil section{border:1px solid var(--line);border-radius:10px;background:var(--fill);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.lvil h4{margin:0;font-size:13px;color:var(--dim)}
+.lvil-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.lvil button{font:inherit;font-size:13px;color:var(--fg);background:transparent;border:1px solid var(--line);border-radius:8px;padding:6px 11px;min-height:32px;cursor:pointer}
+.lvil button:hover:not(:disabled){border-color:var(--acc)}
+.lvil button:disabled{opacity:.5;cursor:default}
+.lvil button[data-active=true]{border-color:var(--acc);font-weight:600}
+.lvil input[type=text],.lvil textarea,.lvil select{font:inherit;font-size:14px;color:var(--fg);background:var(--lumiverse-fill,rgba(0,0,0,.15));border:1px solid var(--line);border-radius:8px;padding:6px 8px;width:100%}
+.lvil textarea{min-height:48px;resize:vertical}
+.lvil-char{border-top:1px dashed var(--line);padding-top:8px;display:flex;flex-direction:column;gap:4px}
+.lvil-note{font-size:12px;color:var(--dim)}
+.lvil-imglist{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}
+.lvil-img{display:flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:8px;padding:6px}
+.lvil-img img{width:48px;height:48px;object-fit:cover;border-radius:6px;background:#0003}
+.lvil-img .sum{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px}
 `;
 
 const ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>';
@@ -51,10 +51,10 @@ export function setup(ctx) {
   const pending = new Map();
   const view = { settings: null, registry: [], auto: true, images: [], status: '', kind: '', busy: false };
 
-  const action = ctx.ui.registerInputBarAction({ id: 'lv-autopic', label: 'LV-AutoPic 설정', iconSvg: ICON, enabled: false });
+  const action = ctx.ui.registerInputBarAction({ id: 'lv-illust', label: '삽화가 설정', iconSvg: ICON, enabled: false });
 
   function request(payload, ms = 20000) {
-    const requestId = 'lvap-' + (++seq) + '-' + Date.now();
+    const requestId = 'lvil-' + (++seq) + '-' + Date.now();
     return new Promise((resolve) => {
       const timer = setTimeout(() => { pending.delete(requestId); resolve({ ok: false, timeout: true, error: '응답 시간 초과' }); }, ms);
       pending.set(requestId, (r) => { clearTimeout(timer); resolve(r); });
@@ -75,7 +75,7 @@ export function setup(ctx) {
     action.setEnabled(!!chatId);
   }
 
-  function setStatus(text, kind = '') { view.status = text; view.kind = kind; const s = modal?.root.querySelector('.lvap-status'); if (s) { s.textContent = text; s.dataset.kind = kind; } }
+  function setStatus(text, kind = '') { view.status = text; view.kind = kind; const s = modal?.root.querySelector('.lvil-status'); if (s) { s.textContent = text; s.dataset.kind = kind; } }
 
   async function loadAll() {
     setStatus('불러오는 중…');
@@ -145,10 +145,10 @@ export function setup(ctx) {
       [1, 2].map((n) => el('option', { value: String(n), selected: s.maxImages === n, text: n + '장' })));
     return el('section', {},
       el('h4', { text: '⚙️ 설정 (계정 전체)' }),
-      el('div', { class: 'lvap-row' }, el('span', {}, '지시 위치'), posSel, depthInput),
-      el('div', { class: 'lvap-row' }, el('span', {}, '지시 역할'), roleSel),
-      el('div', { class: 'lvap-row' }, el('span', {}, '답변당 최대 그림'), maxSel),
-      el('div', { class: 'lvap-note', text: '이 채팅 자동 생성:' },
+      el('div', { class: 'lvil-row' }, el('span', {}, '지시 위치'), posSel, depthInput),
+      el('div', { class: 'lvil-row' }, el('span', {}, '지시 역할'), roleSel),
+      el('div', { class: 'lvil-row' }, el('span', {}, '답변당 최대 그림'), maxSel),
+      el('div', { class: 'lvil-note', text: '이 채팅 자동 생성:' },
         el('button', { type: 'button', 'data-active': String(view.auto), disabled: view.busy, text: view.auto ? '켜짐 (끄기)' : '꺼짐 (켜기)',
           on: { click: toggleAuto } })));
   }
@@ -169,26 +169,26 @@ export function setup(ctx) {
       const next = list.slice(0, idx).concat(list.slice(idx + 1));
       saveRegistry(next);
     } } });
-    return el('div', { class: 'lvap-char' }, namesInput, appearanceInput, el('div', { class: 'lvap-row' }, enabledBtn, saveBtn, delBtn));
+    return el('div', { class: 'lvil-char' }, namesInput, appearanceInput, el('div', { class: 'lvil-row' }, enabledBtn, saveBtn, delBtn));
   }
 
   function registrySection() {
-    if (!characterId) return el('section', {}, el('h4', { text: '👤 인물 외형 등록부' }), el('div', { class: 'lvap-note', text: '캐릭터 카드를 연 채팅에서만 편집할 수 있습니다.' }));
+    if (!characterId) return el('section', {}, el('h4', { text: '👤 인물 외형 등록부' }), el('div', { class: 'lvil-note', text: '캐릭터 카드를 연 채팅에서만 편집할 수 있습니다.' }));
     const list = view.registry.slice();
     const rows = list.map((ch, i) => charRow(ch, i, list));
     const addBtn = el('button', { type: 'button', text: '+ 인물 추가', on: { click: () => {
       saveRegistry([...list, { names: [], appearance: '', enabled: true }]);
     } } });
     return el('section', {}, el('h4', { text: '👤 인물 외형 등록부 (이 카드의 모든 채팅과 공유)' }), ...rows, addBtn,
-      el('div', { class: 'lvap-note', text: '등록부는 비어서 시작합니다. 여기서 추가한 인물만 이름 매칭에 쓰입니다.' }));
+      el('div', { class: 'lvil-note', text: '등록부는 비어서 시작합니다. 여기서 추가한 인물만 이름 매칭에 쓰입니다.' }));
   }
 
   function imagesSection() {
     if (!view.images.length) {
       return el('section', {}, el('h4', { text: '🖼️ 이 채팅의 그림' }),
-        el('div', { class: 'lvap-note', text: '그림이 그려진 답변의 말풍선에서 직접 "다시 그리기"를 쓸 수도 있습니다.' }));
+        el('div', { class: 'lvil-note', text: '그림이 그려진 답변의 말풍선에서 직접 "다시 그리기"를 쓸 수도 있습니다.' }));
     }
-    const rows = view.images.map((img) => el('div', { class: 'lvap-img' },
+    const rows = view.images.map((img) => el('div', { class: 'lvil-img' },
       el('img', { src: img.imageUrl || '', alt: '' }),
       el('div', { class: 'sum', text: img.summary || img.id }),
       el('button', { type: 'button', disabled: view.busy, text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } })));
@@ -197,9 +197,9 @@ export function setup(ctx) {
 
   function render() {
     if (!modal) return;
-    const root = el('div', { class: 'lvap' },
+    const root = el('div', { class: 'lvil' },
       el('style', { text: CSS }),
-      el('div', { class: 'lvap-status', 'data-kind': view.kind, role: 'status', text: view.status }),
+      el('div', { class: 'lvil-status', 'data-kind': view.kind, role: 'status', text: view.status }),
       settingsSection(), registrySection(), imagesSection());
     modal.root.replaceChildren(root);
   }
@@ -207,7 +207,7 @@ export function setup(ctx) {
   async function open() {
     await refreshActive();
     if (!chatId || modal) return;
-    try { modal = ctx.ui.showModal({ title: 'LV-AutoPic', width: 480, maxHeight: 720 }); } catch { return; }
+    try { modal = ctx.ui.showModal({ title: '삽화가 (개인용)', width: 480, maxHeight: 720 }); } catch { return; }
     modal.root.style.overflowY = 'auto';
     modal.onDismiss(() => { modal = null; });
     render();

@@ -1,4 +1,4 @@
-LV-AutoPic — 설치 방법 (개인용)
+삽화가 (개인용) / LV-Illust — 설치 방법
 ====================================================
 ※ 개인용입니다. 다른 사람에게 주거나 GitHub 등에 올리지 마세요. 이 저장소는 로컬 전용입니다
   (git init만 했고 push·원격 저장소 없음).
@@ -7,7 +7,7 @@ LV-AutoPic — 설치 방법 (개인용)
 - 캐릭터 카드마다 "인물 외형 등록부"를 둡니다(이름 여러 개 + 외형 프롬프트 + 켜기/끄기).
 - AI가 답변 속에 <pic chars="이름1, 이름2" prompt="장면 묘사"> 태그를 쓰면, 그 자리에
   NovelAI 그림을 넣습니다. 등록된 이름이면 등록한 외형을 인물 칸(NAI characterTags)에 씁니다.
-- 입력창 버튼 'LV-AutoPic 설정'에서 설정(지시 위치/깊이/역할/답변당 최대 그림)·등록부·
+- 입력창 버튼 '삽화가 설정'에서 설정(지시 위치/깊이/역할/답변당 최대 그림)·등록부·
   이 채팅 자동생성 on/off·그림 목록(다시 그리기)을 관리합니다.
 - 자동 생성은 기본 켜짐, 채팅별로 끌 수 있습니다.
 
@@ -20,17 +20,17 @@ LV-AutoPic — 설치 방법 (개인용)
    컨테이너 이름이 lumiverse라고 가정합니다. 아래는 당신이 직접 실행하는 명령입니다
    (이 에이전트는 실행하지 않습니다 — "설치는 제가 합니다"에 따름).
 
-     docker exec lumiverse mkdir -p /app/data/extensions/lv_autopic
-     docker exec lumiverse sh -c 'rm -rf /app/data/extensions/lv_autopic/repo.prev && \
-       mv /app/data/extensions/lv_autopic/repo /app/data/extensions/lv_autopic/repo.prev 2>/dev/null; true'
-     docker cp -q . lumiverse:/app/data/extensions/lv_autopic/repo
-     docker exec -u 0 lumiverse chown -R bun:bun /app/data/extensions/lv_autopic
+     docker exec lumiverse mkdir -p /app/data/extensions/lv_illust
+     docker exec lumiverse sh -c 'rm -rf /app/data/extensions/lv_illust/repo.prev && \
+       mv /app/data/extensions/lv_illust/repo /app/data/extensions/lv_illust/repo.prev 2>/dev/null; true'
+     docker cp -q . lumiverse:/app/data/extensions/lv_illust/repo
+     docker exec -u 0 lumiverse chown -R bun:bun /app/data/extensions/lv_illust
 
    (.git 폴더가 함께 복사되어도 무방합니다 — DnH 메뉴 확장과 같은 방식입니다.)
 
 3. 불러오기 (서버 주인 계정으로)
    루미버스에 owner로 로그인 → 왼쪽 패널 Extensions(Spindle) → 'Import Local'.
-   목록에 'LV-AutoPic (개인용)'이 꺼진 상태로 나타납니다.
+   목록에 '삽화가 (개인용)'이 꺼진 상태로 나타납니다.
 
 4. 권한 켜기 (전부 admin 승인 필요한 privileged 권한)
    - image_gen    : 그림 생성 (spindle.imageGen.generate)
@@ -38,9 +38,10 @@ LV-AutoPic — 설치 방법 (개인용)
    - chat_mutation: 메시지 읽기/고치기 (그림을 태그 자리에 넣기)
    - characters   : 카드별 인물 등록부 저장
    - chats        : 채팅이 속한 카드 찾기 (등록부를 그 카드 것으로 불러오기 위해)
+   - generation    : GENERATION_ENDED 구독(답변 완료 감지) — spindle.on 자체가 이 권한으로 막혀 있습니다
 
 5. 켜기
-   'LV-AutoPic (개인용)'을 Enable 합니다. 새로고침하면 입력창에 'LV-AutoPic 설정' 버튼이 보입니다.
+   '삽화가 (개인용)'을 Enable 합니다. 새로고침하면 입력창에 '삽화가 설정' 버튼이 보입니다.
 
 6. 써 보기 전 꼭 확인할 것 (docs/API-NOTES.md 참고)
    등록부에 인물 하나를 등록하고(이름 1개 이상, 외형 프롬프트), 그 카드의 채팅에서 AI가
@@ -52,5 +53,5 @@ LV-AutoPic — 설치 방법 (개인용)
 
 업데이트할 때
    src를 고친 뒤 node scripts/build.mjs → node --test test/*.test.mjs → 통과하면
-   2번 복사 단계를 다시 실행하고, Extensions에서 'LV-AutoPic (개인용)' Restart(또는
+   2번 복사 단계를 다시 실행하고, Extensions에서 '삽화가 (개인용)' Restart(또는
    Disable→Enable) 후 새로고침하세요.

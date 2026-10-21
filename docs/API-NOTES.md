@@ -1,4 +1,4 @@
-# API-NOTES — LV-AutoPic
+# API-NOTES — 삽화가 (개인용) / LV-Illust
 
 Everything cited below was read from the Lumiverse container's own type definitions and
 TypeScript source (not from any AutoPic/SillyGgu code — clean room). Paths are inside
@@ -22,6 +22,7 @@ the user before relying on it in production.
 | `chat_mutation` | `spindle.chat.getMessages` / `appendMessage` / `updateMessage` | worker-host.ts: `handleChatUpdateMessage` (~3868), append (~3782) and get-messages (~3718) each do `if (!this.hasPermission("chat_mutation")) throw ...` — **VERIFIED**. Note: `/app/user-docs/docs/extensions/index.md` describes `chat_mutation` only as "hide/unhide + bulk mutations on the current chat" and lists it as auto‑granted — that prose is stale/incomplete; the actual gate in worker-host.ts covers get/append/update/delete too, and LV‑DnH‑Menu (same author, already working in production) relies on exactly this. Trusted the code over the doc. |
 | `characters` | `spindle.characters.get`/`update` for the per‑card registry (F4) | worker-host-content-api.ts:346 `handleCharactersUpdate` — `hasPermission("characters")` check, and shallow merge `{ ...existing.extensions, ...input.extensions }` — **VERIFIED** |
 | `chats` | `spindle.chats.get(chatId)` to resolve the character card that owns a chat | spindle-api.d.ts:836-849 `chats.get` signature — **VERIFIED signature**; permission gate on the host side not individually traced (ran out of budget) but `"chats"` is listed as the permission for this whole namespace in permissions.d.ts and index.md — **INFERRED** gate, standard pattern matches every other namespace checked. |
+| `generation` | `spindle.on("GENERATION_ENDED", ...)` subscription | **Found missing in review, added after the fact.** worker-host.ts `handleSubscribeEvent` (~2646-2668): `GENERATION_EVENTS` (a Set including `EventType.GENERATION_ENDED`) is checked with `if (WorkerHost.GENERATION_EVENTS.has(eventType) && !this.hasPermission("generation")) { ...; this.postToWorker({ type: "permission_denied", ... }); return; }` — **VERIFIED**. Without this permission, `handleGenerationEnded` (the whole F2 tag-detection path) silently never fires; nothing throws, the subscription is just dropped at registration time with a console warning on the host side only. |
 
 `ui_panels` was **not** declared — LV‑DnH‑Menu (proven working) also omits it while
 using `registerInputBarAction`/`showModal` from the frontend context, and
@@ -59,7 +60,7 @@ independently re-derived from the installer's permission-check code.
   before setting `[IDENTIFIER]`, so another extension's keys on the same message survive
   a write from this one — but only as long as nothing races between this extension's own
   read and write. No optimistic-concurrency check exists in the API, so two extensions
-  (or two overlapping LV‑AutoPic calls) updating metadata on the same message at the same
+  (or two overlapping lv_illust calls) updating metadata on the same message at the same
   moment can still clobber each other. Not addressed — acceptable for an MVP that is the
   only metadata-writing extension expected to touch these messages, but worth remembering
   before installing a second metadata-writing extension alongside it.
@@ -120,11 +121,11 @@ independently re-derived from the installer's permission-check code.
 
 - `character.extensions` is `Record<string, any>`, and `characters.update` shallow-merges
   the whole extensions object (`{ ...existing.extensions, ...input.extensions }`) —
-  **VERIFIED** (worker-host-content-api.ts:367). LV-AutoPic always writes the *entire*
-  `extensions.lv_autopic` value in one call, so this is safe: only our own namespaced key
+  **VERIFIED** (worker-host-content-api.ts:367). lv_illust always writes the *entire*
+  `extensions.lv_illust` value in one call, so this is safe: only our own namespaced key
   is replaced, every other extension's key under `extensions` survives untouched.
 - Registry starts empty by construction: `normalizeRegistry()` returns `[]` for any
-  character whose `extensions.lv_autopic` is missing or malformed, and nothing in this
+  character whose `extensions.lv_illust` is missing or malformed, and nothing in this
   codebase ever writes a non-empty default. Verified by test
   (`normalizeRegistry: empty/missing input yields empty registry (never pre-seeded)`).
 
