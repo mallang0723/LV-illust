@@ -108,6 +108,35 @@ const STATES = (process.env.STATES || 'main').split(',');
 
 const browser = await firefox.launch(process.env.FIREFOX_BIN ? { executablePath: process.env.FIREFOX_BIN } : {});
 const written = [];
+// CHECK=1: Lumiverse UI checklist at 360px (text >= 13px hard floor, body text >= 15px listed,
+// tap targets >= 44px, no nested scroll containers, no horizontal overflow).
+async function checklist(page, theme) {
+  await page.evaluate(() => {
+    for (const b of document.querySelectorAll('.lvil [aria-expanded=false]')) b.click();
+  });
+  await page.waitForTimeout(200);
+  const r = await page.evaluate(() => {
+    const out = { small: [], mid: [], tap: [], scroll: [], hscroll: false, count: 0 };
+    const root = document.querySelector('.lvil');
+    const box = (n) => (n.className && typeof n.className === 'string' ? '.' + n.className.split(' ')[0] : n.tagName.toLowerCase());
+    for (const n of root.querySelectorAll('*')) {
+      const cs = getComputedStyle(n);
+      const r = n.getBoundingClientRect();
+      if (!r.width || !r.height || cs.visibility === 'hidden') continue;
+      out.count++;
+      const own = [...n.childNodes].some((c) => c.nodeType === 3 && c.textContent.trim());
+      const fs = parseFloat(cs.fontSize);
+      if (own && fs < 13) out.small.push(box(n) + ' ' + fs);
+      else if (own && fs < 15) out.mid.push(box(n) + ' ' + fs + ' "' + n.textContent.trim().slice(0, 24) + '"');
+      if (['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(n.tagName) && Math.round(r.height) < 44) out.tap.push(box(n) + ' h=' + Math.round(r.height) + ' "' + (n.textContent || n.placeholder || '').slice(0, 16) + '"');
+      if (/(auto|scroll)/.test(cs.overflowY) && n.scrollHeight > n.clientHeight + 1 && n.tagName !== 'TEXTAREA') out.scroll.push(box(n));
+    }
+    const body = root.closest('[data-spindle-modal]').parentElement;
+    out.hscroll = body.scrollWidth > body.clientWidth + 1;
+    return out;
+  });
+  console.log('CHECKLIST', theme, JSON.stringify({ elements: r.count, under13: [...new Set(r.small)], under15: [...new Set(r.mid)], tapUnder44: r.tap, nestedScroll: r.scroll, horizontalOverflow: r.hscroll }));
+}
 try {
   for (const theme of ['light', 'dark']) {
     for (const cfg of SHOTS) {
@@ -139,6 +168,7 @@ try {
           else await page.screenshot({ path: file });
           written.push(file);
         }
+        if (process.env.CHECK && cfg.width === 360 && view === 'fold') await checklist(page, theme);
         if (errors.length) console.error('PAGE ERRORS', theme, cfg.width, errors);
         await context.close();
       }
