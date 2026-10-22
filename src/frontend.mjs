@@ -142,11 +142,10 @@ color:var(--fg);font-size:15px;line-height:1.45;display:flex;flex-direction:colu
 .lvil-sec-title{font-weight:700;font-size:16px}
 .lvil-sec-end{display:flex;align-items:center;gap:8px;min-width:0}
 .lvil-sec-badge{font-size:13px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:3px 10px;white-space:nowrap;background:var(--field)}
-.lvil-chev{font-size:20px;line-height:1;color:var(--dim);transition:transform .15s}
-.lvil-sec-toggle[aria-expanded=true] .lvil-chev{transform:rotate(90deg)}
+.lvil-chev{font-size:16px;line-height:1;color:var(--dim)}
 .lvil-sec-body{display:flex;flex-direction:column;gap:12px;padding:2px 10px 12px;border-top:1px solid var(--line)}
-.lvil-note{font-size:14px;color:var(--dim);line-height:1.45}
-.lvil-hint{font-size:14px;color:var(--dim);margin-top:-6px}
+.lvil-note{font-size:15px;color:var(--dim);line-height:1.45}
+.lvil-hint{font-size:15px;color:var(--dim);margin-top:-6px}
 .lvil-field{display:flex;flex-direction:column;gap:6px}
 .lvil-field>label,.lvil-label{font-size:15px;font-weight:600}
 .lvil-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -157,11 +156,11 @@ color:var(--fg);font-size:15px;line-height:1.45;display:flex;flex-direction:colu
 .lvil-tile{display:flex;flex-direction:column;gap:6px;min-width:0}
 .lvil .lvil-thumb{position:relative;display:block;width:100%;aspect-ratio:4/3;padding:0;overflow:hidden;border-radius:10px;background:var(--field)}
 .lvil-thumb img{width:100%;height:100%;object-fit:cover;display:block}
-.lvil-noimg{display:flex;width:100%;height:100%;align-items:center;justify-content:center;font-size:13px;color:var(--dim)}
+.lvil-noimg{display:flex;width:100%;height:100%;align-items:center;justify-content:center;font-size:15px;color:var(--dim)}
 .lvil-pill{position:absolute;left:6px;top:6px;font-size:13px;line-height:1;padding:4px 8px;border-radius:999px;background:var(--bad);color:#fff}
 .lvil-pill[data-kind=skip]{background:var(--dim)}
-.lvil-cap{font-size:13px;color:var(--dim);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
-.lvil-reason{font-size:13px;color:var(--dim)}
+.lvil-cap{font-size:15px;color:var(--dim);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.lvil-reason{font-size:15px;color:var(--dim)}
 .lvil-detail{display:flex;flex-direction:column;gap:12px}
 .lvil-detail img{width:100%;height:auto;max-height:60vh;object-fit:contain;border-radius:10px;background:var(--field)}
 .lvil-block{display:flex;flex-direction:column;gap:6px}
@@ -173,11 +172,10 @@ color:var(--fg);font-size:15px;line-height:1.45;display:flex;flex-direction:colu
 .lvil-char-meta{font-size:13px;color:var(--dim);white-space:nowrap}
 .lvil-char-body{display:flex;flex-direction:column;gap:12px;padding:4px 10px 12px;border-top:1px solid var(--line)}
 .lvil-review{border:1px solid var(--acc);border-radius:10px;padding:10px 12px;font-size:15px;display:flex;flex-direction:column;gap:8px}
-.lvil-review code{font:13px ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--field);border-radius:6px;padding:1px 6px;overflow-wrap:anywhere}
-.lvil-legacy{font-size:13px;color:var(--dim);display:flex;flex-direction:column;gap:6px}
+.lvil-review code{font:15px ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--field);border-radius:6px;padding:1px 6px;overflow-wrap:anywhere}
+.lvil-legacy{font-size:15px;color:var(--dim);display:flex;flex-direction:column;gap:6px}
 .lvil-chiprow{display:flex;flex-wrap:wrap;gap:6px}
 .lvil .lvil-chiprow button{min-height:44px;border-radius:999px;font-size:15px;padding:6px 12px}
-@media (prefers-reduced-motion:reduce){.lvil *{transition:none!important}}
 `;
 
 const ICON = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>';
@@ -420,7 +418,7 @@ export function setup(ctx) {
     const toggle = el('button', { type: 'button', class: 'lvil-sec-toggle', 'aria-expanded': String(open), 'data-section': key,
       on: { click: () => { openSections[key] = !openSections[key]; render(); } } },
       el('span', { class: 'lvil-sec-title', text: title }),
-      el('span', { class: 'lvil-sec-end' }, badge ? el('span', { class: 'lvil-sec-badge', text: badge }) : null, el('span', { class: 'lvil-chev', 'aria-hidden': 'true', text: '›' })));
+      el('span', { class: 'lvil-sec-end' }, badge ? el('span', { class: 'lvil-sec-badge', text: badge }) : null, el('span', { class: 'lvil-chev', 'aria-hidden': 'true', text: open ? '▾' : '▸' })));
     return el('section', { class: 'lvil-sec' }, toggle, body);
   }
 
@@ -508,7 +506,7 @@ export function setup(ctx) {
       block('네거티브 프롬프트', img.negative, '네거티브'),
       (img.slots || []).length ? el('div', { class: 'lvil-block' }, el('span', { class: 'lvil-label', text: '인물 칸 (NAI 캐릭터 프롬프트)' }),
         ...img.slots.map((t, i) => el('pre', { class: 'lvil-pre', text: `${i + 1}. ${t}` }))) : null,
-      img.negative || (img.slots || []).length ? null : el('div', { class: 'lvil-note', text: '이전 버전에서 그린 그림은 장면 프롬프트만 기록되어 있습니다.' }),
+      img.recorded ? null : el('div', { class: 'lvil-note', text: '이전 버전에서 그린 그림은 장면 프롬프트만 기록되어 있습니다.' }),
       isOrphan ? null : el('button', { type: 'button', 'data-variant': 'primary', disabled: view.busy || !sectionOk('images'), text: '다시 그리기', on: { click: () => regenerate(img.id, img.messageId) } }));
   }
 

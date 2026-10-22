@@ -96,6 +96,7 @@ function promptDetails(rec) {
   const out = {};
   const prompt = typeof rec.finalPrompt === 'string' && rec.finalPrompt ? rec.finalPrompt : (typeof rec.prompt === 'string' ? rec.prompt : '');
   if (prompt) out.prompt = prompt;
+  if (typeof rec.finalPrompt === 'string' && rec.finalPrompt) out.recorded = true; // 0.2.0+ record: `prompt` is what was actually sent
   if (typeof rec.negativePrompt === 'string' && rec.negativePrompt) out.negative = rec.negativePrompt;
   const slots = Array.isArray(rec.characterTags) ? rec.characterTags.map((c) => String(c?.tags ?? '')).filter(Boolean) : [];
   if (slots.length) out.slots = slots;
