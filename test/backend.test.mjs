@@ -102,12 +102,13 @@ test('GENERATION_ENDED success: tag replaced with rendered image, metadata recor
   const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
   assert.deepEqual(genInput.parameters.characterTags, [{ tags: '1boy, silver hair' }]);
   // review finding 5: generateNative (not generate), chat_id (not owner_chat_id),
-  // promptMode:'custom' + skipParse:true so Lumiverse's own scene-analysis step is
-  // skipped (and therefore never overwrites our characterTags) while its native
-  // style/LoRA preset composition still applies — see docs/API-NOTES.md.
+  // promptMode:'custom' so Lumiverse's own scene-analysis step is skipped (and therefore
+  // never overwrites our characterTags) while its native style/LoRA preset composition
+  // still applies — see docs/API-NOTES.md. 0.2.0: skipParse is OFF by default so the host
+  // can expand the card/persona-bound negative (settings.boundNegatives, default on).
   assert.equal(genInput.chat_id, 'c1');
   assert.equal(genInput.promptMode, 'custom');
-  assert.equal(genInput.skipParse, true);
+  assert.equal('skipParse' in genInput, false);
   assert.equal(genInput.includeDataUrl, false);
 });
 
@@ -540,7 +541,7 @@ test('REGRESSION (2nd pass, finding 4): regenerate with a missing imageUrl prese
   assert.equal(msg.metadata.lv_illust.images.p1.imageUrl, 'https://img/old.png'); // untouched
 });
 
-test('REGRESSION (2nd pass, finding 5): generation requests use generateNative with promptMode "custom" and skipParse true ' +
+test('REGRESSION (2nd pass, finding 5): generation requests use generateNative with promptMode "custom" (skipParse only when bound negatives are switched off) ' +
   '(so Lumiverse\'s native style/LoRA preset composes onto our prompt, but scene-analysis never overwrites our characterTags)', async () => {
   const msg = assistantMsg('m1', '<pic chars="아드리안" prompt="골목">');
   const f = fakeApi({
@@ -551,7 +552,7 @@ test('REGRESSION (2nd pass, finding 5): generation requests use generateNative w
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
   const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
   assert.equal(genInput.promptMode, 'custom');
-  assert.equal(genInput.skipParse, true);
+  assert.equal('skipParse' in genInput, false);
   assert.equal(genInput.chat_id, 'c1');
   assert.deepEqual(genInput.parameters.characterTags, [{ tags: 'tag' }]);
   assert.equal(f.calls.find((c) => c[0] === 'imageGen.generate'), undefined); // the old API is not used at all
@@ -573,7 +574,7 @@ test('REGRESSION (3rd pass, finding 2): the active main preset\'s positive promp
   assert.ok(f.calls.some((c) => c[0] === 'imageGen.getPromptPresets'));
 });
 
-test('REGRESSION (3rd pass, finding 2): character/persona macro tokens in the main preset are stripped, never sent to the provider as literal text', async () => {
+test('REGRESSION (3rd pass, finding 2): with bound negatives switched off, character/persona macro tokens in the main preset are stripped, never sent as literal text (skipParse back on)', async () => {
   const msg = assistantMsg('m1', '<pic prompt="forest">');
   const f = fakeApi({
     messages: { c1: [msg] }, chats: { c1: { id: 'c1' } },
@@ -581,9 +582,11 @@ test('REGRESSION (3rd pass, finding 2): character/persona macro tokens in the ma
       { id: 'p1', name: 'Main', mode: 'custom', prompt: 'style, {{character_prompt}}', negativePrompt: '{{persona_negative_prompt}}' },
     ] },
   });
+  f.storage['settings.json'] = { boundNegatives: false };
   const svc = createService(f.api, { idGenerator: counterIdGen() });
   await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
   const [, genInput] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(genInput.skipParse, true);
   assert.ok(!genInput.prompt.includes('{{'));
   assert.equal(genInput.prompt, 'style, forest');
   // negative was macro-only -> cleaned to empty -> field omitted entirely (lets the
@@ -1081,4 +1084,98 @@ test('OPERATOR SCOPE: the acting userId reaches characters/chats/imageGen calls 
   assert.equal(reg.registry.length, 1);
   const injected = await r.hostRunInterceptor([{ role: 'user', content: 'hi' }], { chatId: 'c1', characterId: 'ch1', userId: 'u1' });
   assert.ok(JSON.stringify(injected).includes('아드리안'), 'interceptor roster loaded with context.userId');
+});
+
+// ---------------------------------------------------------------- 0.2.0: negatives, body/outfit, preview
+
+const REG02 = [{ id: 'c0', names: ['아드리안'], body: '1boy, silver hair', outfit: 'black coat', negative: 'extra fingers', enabled: true }];
+const withCard = (extra = {}) => fakeApi({
+  messages: { c1: [assistantMsg('m1', '<pic chars="아드리안: smirking | 옷: suit" prompt="골목">')] },
+  chats: { c1: { id: 'c1', character_id: 'char1' } },
+  characters: { char1: { id: 'char1', extensions: { lv_illust: { characters: REG02 } } } },
+  ...extra,
+});
+
+test('0.2.0: generation sends body, then (overridden) outfit, then action; negative = preset + common + scene character negatives', async () => {
+  const f = withCard({ promptPresets: { activeId: 'p1', presets: [{ id: 'p1', prompt: 'masterpiece', negativePrompt: 'lowres' }] } });
+  f.storage['settings.json'] = { commonNegative: 'text, LOWRES' };
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, g] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.deepEqual(g.parameters.characterTags, [{ tags: '1boy, silver hair, suit, smirking' }]);
+  assert.equal(g.negativePrompt, 'lowres, text, extra fingers');
+  assert.equal(g.prompt, 'masterpiece, 골목');
+});
+
+test('0.2.0: with no negative anywhere the field is omitted (host default stays in force)', async () => {
+  const f = fakeApi({
+    messages: { c1: [assistantMsg('m1', '<pic prompt="forest">')] }, chats: { c1: { id: 'c1' } },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, g] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal('negativePrompt' in g, false);
+});
+
+test('0.2.0: bound negative tokens are handed to the host (skipParse off) while positive ones are stripped', async () => {
+  const f = fakeApi({
+    messages: { c1: [assistantMsg('m1', '<pic prompt="forest">')] }, chats: { c1: { id: 'c1' } },
+    promptPresets: { activeId: 'p1', presets: [{ id: 'p1', prompt: '{{character_prompt}}, style', negativePrompt: 'bad, {{character_negative_prompt}}, {{persona_negative_prompt}}' }] },
+  });
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const [, g] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal('skipParse' in g, false);
+  assert.equal(g.prompt, 'style, forest');
+  assert.equal(g.negativePrompt, 'bad, {{character_negative_prompt}}, {{persona_negative_prompt}}');
+});
+
+test('0.2.0: the composed prompt/negative and character negatives are recorded, shown by list_images, and replayed by regenerate', async () => {
+  const f = withCard();
+  f.storage['settings.json'] = { commonNegative: 'text' };
+  const svc = createService(f.api, { idGenerator: counterIdGen() });
+  await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+  const rec = f.calls.find((c) => c[0] === 'updateMessage')[3].metadata.lv_illust.images.p1;
+  assert.deepEqual(rec.negatives, ['extra fingers']);
+  assert.equal(rec.finalPrompt, '골목');
+  assert.equal(rec.negativePrompt, 'text, extra fingers');
+  const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
+  assert.equal(images[0].prompt, '골목');
+  assert.equal(images[0].negative, 'text, extra fingers');
+  assert.deepEqual(images[0].slots, ['1boy, silver hair, suit, smirking']);
+  // regenerate: same negatives, even if the card's registry changed afterwards
+  f.calls.length = 0;
+  await svc.runFrontendRequest({ type: 'regenerate', chatId: 'c1', messageId: 'm1', imageId: 'p1' });
+  const [, g] = f.calls.find((c) => c[0] === 'imageGen.generateNative');
+  assert.equal(g.negativePrompt, 'text, extra fingers');
+  assert.deepEqual(g.parameters.characterTags, [{ tags: '1boy, silver hair, suit, smirking' }]);
+});
+
+test('0.2.0: preview_prompt composes without generating; a draft registry overrides the saved one', async () => {
+  const f = withCard({ promptPresets: { activeId: 'p1', presets: [{ id: 'p1', prompt: 'masterpiece', negativePrompt: 'lowres' }] } });
+  const svc = createService(f.api);
+  const r = await svc.runFrontendRequest({ type: 'preview_prompt', characterId: 'char1', chars: '아드리안', scene: '골목' });
+  assert.equal(r.prompt, 'masterpiece, 골목');
+  assert.equal(r.negativePrompt, 'lowres, extra fingers');
+  assert.deepEqual(r.characterTags, [{ tags: '1boy, silver hair, black coat' }]);
+  assert.equal(r.hasMainPreset, true);
+  const d = await svc.runFrontendRequest({ type: 'preview_prompt', characterId: 'char1', chars: '아드리안', scene: '골목',
+    registry: [{ names: ['아드리안'], body: 'draft body', outfit: 'draft outfit', negative: '' }] });
+  assert.deepEqual(d.characterTags, [{ tags: 'draft body, draft outfit' }]);
+  assert.equal(f.calls.some((c) => c[0] === 'imageGen.generateNative'), false);
+});
+
+test('0.2.0: legacy combined-appearance cards load split, flagged for review, original kept; saving round-trips the new shape', async () => {
+  const f = fakeApi({ characters: { char1: { id: 'char1', extensions: { lv_illust: { characters: [
+    { names: ['아드리안'], appearance: '1boy, silver hair, black coat, mystery', enabled: true }] } } } } });
+  const svc = createService(f.api);
+  const { registry } = await svc.runFrontendRequest({ type: 'load_registry', characterId: 'char1' });
+  assert.equal(registry[0].body, '1boy, silver hair, mystery');
+  assert.equal(registry[0].outfit, 'black coat');
+  assert.equal(registry[0].legacyAppearance, '1boy, silver hair, black coat, mystery');
+  assert.equal(registry[0].needsReview, true);
+  const saved = await svc.runFrontendRequest({ type: 'save_registry', characterId: 'char1', registry: [{ ...registry[0], needsReview: false, reviewTags: [] }] });
+  assert.equal(saved.registry[0].needsReview, undefined);
+  assert.equal(saved.registry[0].legacyAppearance, '1boy, silver hair, black coat, mystery');
+  assert.equal('appearance' in f.calls.filter((c) => c[0] === 'characters.update').at(-1)[2].extensions.lv_illust.characters[0], false);
 });

@@ -13,7 +13,7 @@
 import {
   normalizeSettings, normalizeRegistry, planMessage,
   renderSuccessMarker, renderFailureMarker, stripRenderedImages, hasLiveTags,
-  injectInstruction, markerRegexForId, buildFinalPrompt, IDENTIFIER,
+  injectInstruction, markerRegexForId, buildFinalPrompt, composeScene, IDENTIFIER,
 } from './core.mjs';
 
 const SETTINGS_PATH = 'settings.json';
@@ -87,6 +87,19 @@ async function characterIdForChat(api, chatId, userId) {
 
 async function saveRegistry(api, characterId, registry, userId) {
   await api.characters.update(characterId, { extensions: { [IDENTIFIER]: { characters: registry } } }, withUser(userId));
+}
+
+/** What the panel's detail view shows for an image record: the prompt text that was sent
+ *  (the composed one when recorded, else the scene prompt of older records), its negative,
+ *  and the NAI per-character slots. Pure read of stored metadata. */
+function promptDetails(rec) {
+  const out = {};
+  const prompt = typeof rec.finalPrompt === 'string' && rec.finalPrompt ? rec.finalPrompt : (typeof rec.prompt === 'string' ? rec.prompt : '');
+  if (prompt) out.prompt = prompt;
+  if (typeof rec.negativePrompt === 'string' && rec.negativePrompt) out.negative = rec.negativePrompt;
+  const slots = Array.isArray(rec.characterTags) ? rec.characterTags.map((c) => String(c?.tags ?? '')).filter(Boolean) : [];
+  if (slots.length) out.slots = slots;
+  return out;
 }
 
 function existingImageIds(messages) {
@@ -195,8 +208,17 @@ async function fetchMainPreset(api, userId) {
   }
 }
 
-async function generateImage(api, { chatId, prompt, characterTags, mainPreset, generateTimeoutMs, userId }) {
-  const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset);
+async function generateImage(api, { chatId, prompt, characterTags, negatives, settings, mainPreset, generateTimeoutMs, userId }) {
+  // 0.2.0: the negative prompt is composed here (preset negative + 공통 네거티브 + the scene
+  // characters' own negatives, de-duplicated — see core.buildFinalPrompt). With
+  // `boundNegatives` on, `skipParse` is left off so the HOST expands the card/persona-bound
+  // negative tokens (image-gen.service.ts resolvePromptInput: expandCharacterPromptMacro is
+  // skipped only under skipParse); `promptMode:'custom'` alone still keeps scene analysis
+  // from overwriting our characterTags (resolveImagePrompt returns custom input as-is).
+  const boundNegatives = settings?.boundNegatives !== false;
+  const { prompt: finalPrompt, negativePrompt } = buildFinalPrompt(prompt, mainPreset, {
+    commonNegative: settings?.commonNegative, characterNegatives: negatives, boundNegatives,
+  });
   const uid = withUser(userId);
   const result = await queuedCall(() => api.imageGen.generateNative({
     chat_id: chatId,
@@ -204,7 +226,7 @@ async function generateImage(api, { chatId, prompt, characterTags, mainPreset, g
     prompt: finalPrompt,
     ...(negativePrompt !== undefined ? { negativePrompt } : {}),
     promptMode: 'custom',
-    skipParse: true,
+    ...(boundNegatives ? {} : { skipParse: true }),
     parameters: { characterTags },
     includeDataUrl: false,
   }), generateTimeoutMs);
@@ -216,7 +238,7 @@ async function generateImage(api, { chatId, prompt, characterTags, mainPreset, g
   if (!result || typeof result.imageUrl !== 'string' || !result.imageUrl) {
     throw new Error('이미지 URL을 받지 못함(생성 결과에 사용 가능한 그림 없음)');
   }
-  return result;
+  return { ...result, composed: { prompt: finalPrompt, negativePrompt: negativePrompt || '' } };
 }
 
 /** Merge our namespaced key into a message's existing metadata bag without clobbering
@@ -378,7 +400,7 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
 
   for (const s of skipped) {
     tagIndexToId.set(s.tagIndex, s.id);
-    resultsById[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, summary: s.summary };
+    resultsById[s.id] = { status: 'skip', prompt: s.prompt, characterTags: s.characterTags, negatives: s.negatives, summary: s.summary };
   }
 
   // Fetched once per message-processing pass (not per tag) — the active main preset
@@ -388,17 +410,18 @@ async function processMessageInner(api, { chatId, messageId, registry, settings,
   for (const job of jobs) {
     tagIndexToId.set(job.tagIndex, job.id);
     try {
-      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, mainPreset, generateTimeoutMs, userId });
+      const result = await generateImage(api, { chatId, prompt: job.prompt, characterTags: job.characterTags, negatives: job.negatives, settings, mainPreset, generateTimeoutMs, userId });
       markers.set(job.tagIndex, { mode: 'replace', text: renderSuccessMarker(job.id, result.imageUrl, job.summary) });
       resultsById[job.id] = {
         status: 'ok', prompt: job.prompt, characterTags: job.characterTags,
+        negatives: job.negatives, finalPrompt: result.composed.prompt, negativePrompt: result.composed.negativePrompt,
         imageId: result.imageId, imageUrl: result.imageUrl, summary: job.summary,
       };
     } catch (err) {
       const reason = String(err?.message || err || '오류').slice(0, 80);
       markers.set(job.tagIndex, { mode: 'replace', text: renderFailureMarker(job.id, tags[job.tagIndex], reason) });
       resultsById[job.id] = {
-        status: 'fail', prompt: job.prompt, characterTags: job.characterTags,
+        status: 'fail', prompt: job.prompt, characterTags: job.characterTags, negatives: job.negatives,
         reason, summary: job.summary,
       };
     }
@@ -557,7 +580,7 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
           const images = m.metadata?.[IDENTIFIER]?.images;
           if (!images) continue;
           for (const [id, rec] of Object.entries(images)) {
-            out.push({ id, messageId: m.id, status: rec.status, summary: rec.summary, imageUrl: rec.imageUrl });
+            out.push({ id, messageId: m.id, status: rec.status, summary: rec.summary, imageUrl: rec.imageUrl, ...promptDetails(rec) });
           }
         }
         // Orphaned generations (review finding 1: produced but couldn't be spliced back
@@ -566,9 +589,19 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
         // nothing a generation actually produced is silently lost.
         const orphans = await loadOrphans(api, payload.chatId);
         for (const o of orphans) {
-          out.push({ id: o.id, messageId: o.messageId, status: 'orphan', summary: o.summary, imageUrl: o.imageUrl, reason: o.reason });
+          out.push({ id: o.id, messageId: o.messageId, status: 'orphan', summary: o.summary, imageUrl: o.imageUrl, reason: o.reason, ...promptDetails(o) });
         }
         return { images: out };
+      }
+      case 'preview_prompt': {
+        // Read-only: composes what a tag WOULD send (no generation). `registry` may be the
+        // panel's unsaved draft; otherwise the card's saved registry is used.
+        const draft = Array.isArray(payload.registry) ? normalizeRegistry({ characters: payload.registry }) : null;
+        const registry = draft || await loadRegistry(api, payload.characterId, userId);
+        const settings = await readSettings(api);
+        const mainPreset = await fetchMainPreset(api, userId);
+        const r = composeScene({ chars: String(payload.chars ?? ''), scene: String(payload.scene ?? ''), registry, mainPreset, settings });
+        return { ...r, hasMainPreset: !!mainPreset, boundNegatives: settings.boundNegatives };
       }
       case 'load_auto':
         return { auto: await isAutoOn(api, payload.chatId, true) };
@@ -608,7 +641,8 @@ async function regenerateLocked(api, payload, isExpired = () => false, generateT
     // unusable result), the existing marker/metadata for this image is left completely
     // untouched, so a working image is never replaced by a broken one.
     const mainPreset = await fetchMainPreset(api, userId);
-    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, mainPreset, generateTimeoutMs, userId });
+    const settings = await readSettings(api);
+    result = await generateImage(api, { chatId: payload.chatId, prompt: rec.prompt, characterTags: rec.characterTags, negatives: rec.negatives, settings, mainPreset, generateTimeoutMs, userId });
   } catch (err) {
     throw new Error('다시 그리기 실패: ' + String(err?.message || err));
   }
@@ -619,7 +653,7 @@ async function regenerateLocked(api, payload, isExpired = () => false, generateT
   if (isExpired()) return { ok: false, expired: true };
   const freshList = await api.chat.getMessages(payload.chatId);
   const fresh = freshList.find((m) => m.id === payload.messageId);
-  const updated = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl };
+  const updated = { ...rec, status: 'ok', imageId: result.imageId, imageUrl: result.imageUrl, finalPrompt: result.composed.prompt, negativePrompt: result.composed.negativePrompt };
   if (!fresh || (fresh.swipe_id ?? 0) !== originalSwipeId) {
     if (!isExpired()) {
       await pushOrphans(api, payload.chatId, [{
