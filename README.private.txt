@@ -4,12 +4,14 @@ src/core.mjs     태그 파싱·이름 매칭·프롬프트 조립·마커 생�
 src/backend.mjs  GENERATION_ENDED/MESSAGE_EDITED 처리, imageGen.generate, chat.updateMessage,
                  characters.update(등록부), storage(설정), variables.chat(채팅별 자동생성 on/off),
                  registerInterceptor(F1 지시 끼워넣기 + 히스토리 그림 자리 요약)
-src/frontend.mjs 입력창 버튼 '삽화가 설정' + 호스트 모달(설정/등록부/자동생성 토글/이 채팅 그림 목록)
+src/frontend.mjs 입력창 버튼 '삽화가 설정' + 호스트 모달(개요 카드 + 접이식 4구역: 그림 타일·상세 / 인물 카드 / 프롬프트 미리보기 / 설정)
 scripts/build.mjs  src -> dist (의존성 없음). 빌드: node scripts/build.mjs
 scripts/pack.mjs   dist/+spindle.json+README* -> release/lv_illust-<version>.zip (재현 가능한 빌드,
                    고정 타임스탬프 + zip -X, 두 번 빌드해도 바이트 단위로 동일함 확인됨)
-test/            node --test test/*.test.mjs — 2026-10-21 기준 전부 통과, 143개(0.1.1: 권한 늦게 허용·부분 로드 실패·
+test/            node --test test/*.test.mjs — 0.2.0 기준 전부 통과(기존 143개 + 신체/옷 분리·네거티브·패널 테스트;
+                 0.1.1: 권한 늦게 허용·부분 로드 실패·
                  operator 설치 userId 테스트 추가)
+test/e2e/shots.e2e.mjs  스크린샷(밝은/어두운 호스트 테마, 360·1280px) + CHECK=1로 글자 크기·터치 크기·안쪽 스크롤 점검
 test/e2e/modal.e2e.mjs  Playwright(Firefox·Chromium, 터치 360x460)로 설정 창이 실제로 눌리는지 확인 —
                  node --test에는 안 들어감. 실행법은 파일 머리 주석
 

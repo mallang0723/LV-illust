@@ -17,13 +17,51 @@ prompt slots (`characterTags`).
 | F1 | Before generation, injects an instruction ("if a picture is needed, write `<pic chars="name" prompt="scene">`") into the prompt. Position/depth/role are configurable. |
 | F2 | On generation end, finds `<pic>` tags in the reply and renders them one by one. Max 2 images per reply (configurable); extra tags get a visible "skipped" marker. A malformed tag's original text is **never deleted or summarized** — it's left byte-for-byte in place, with only a short marker appended right next to it (message length never shrinks because of malformed-tag handling). |
 | F3 | Matches names in a tag against the registry (multiple aliases per character, longest-alias-first, case/whitespace-insensitive, a partial match only counts at a real word boundary), substitutes the registered appearance prompt, and routes it to NAI's character slot. Unregistered or disabled characters fall back to whatever the AI itself described in the scene text. |
-| F4 | A per-character-card appearance registry (names, appearance prompt, on/off), shared across every chat using that card. **Starts empty** — nothing is pre-seeded. |
+| F4 | A per-character-card registry (names, **body traits**, **outfit & accessories**, per-character negative, on/off), shared across every chat using that card. **Starts empty** — nothing is pre-seeded. |
 | F5 | Renders the image directly in place of the tag (`chat.updateMessage`). Failures and over-the-cap skips each get a distinct, recoverable marker; the original tag data is kept in message metadata. Generation goes through Lumiverse's own `imageGen.generateNative`, composing both the active main prompt preset and the active style/LoRA preset onto the scene prompt (scene prompt alone if neither is set). |
-| F6 | The input-bar "삽화가 설정" (Illustrator Settings) panel lists this chat's generated images with a "다시 그리기" (regenerate) button. If the message changed (edited/swiped) while a generation was in flight, the image is never discarded — it's kept as a recoverable, status-only entry (no regenerate button — there's nowhere left to put it) in that same panel instead. |
+| F6 | The input-bar "삽화가 설정" (Illustrator Settings) panel shows this chat's generated images as tiles; tapping one opens the prompt, negative and character slots that were sent, with a "다시 그리기" (regenerate) button. If the message changed (edited/swiped) while a generation was in flight, the image is never discarded — it's kept as a recoverable, status-only entry (no regenerate button — there's nowhere left to put it) in that same panel instead. |
 
 Lumiverse's own main/style prompt presets, per-card presets, and auto-scene generation are
 left untouched — this extension only adds "in-reply picture tags" + "per-character
 appearance registry," nothing Lumiverse already does natively.
+
+## What's new in 0.2.0
+
+**Panel redesign.** An overview card (status line, summary chips, this chat's auto-generate
+switch) above four collapsible sections — pictures, characters, prompt preview, settings —
+each with a one-line summary badge. Pictures are a tile grid with a detail view (the prompt,
+negative and per-character slots actually sent, a copy button that also works over plain
+http). Characters are cards with separate fields. The prompt preview composes what a
+`<pic>` tag would send without generating anything, using unsaved edits. Text >= 15px
+(secondary >= 13px), 44px tap targets, no nested scroll containers, readable in light and
+dark host themes.
+
+**Body / outfit split.** Each character stores 신체 특성 (body) and 옷·장신구 (outfit)
+separately; the prompt order is body, then outfit, then the scene action. Combined 0.1.x
+appearances are split once on first read with a conservative keyword heuristic; ambiguous
+tags stay in body and raise a "확인해 주세요" (please check) hint until the character is
+saved. The original string is kept (`legacyAppearance`) and can be restored from the panel.
+A per-scene outfit: `chars="Name: action | 옷: black suit"` replaces the saved outfit for
+that one picture only (body untouched). The extension does not extract appearance from the
+chat, so the heuristic only runs for migration and the panel's "split automatically" button.
+
+**Negative prompt.** Final negative = main preset negative + common negative (settings) +
+negatives of the characters in the scene, de-duplicated case-insensitively; sent explicitly
+whenever non-empty, omitted when empty (host default stays). Host limitation: for
+NovelAI V4+ the host writes the same global negative into every character's `uc` and
+`char_captions`, and `characterTags` items are only `{ tags }`, so per-character negatives
+are merged into the global one. Sending a negative replaces the host's built-in NovelAI
+default, so paste the list you want into the common negative field. Bound
+(card/persona) negatives: Spindle exposes neither the bound presets nor the bindings, so by
+default the two `..._negative_prompt` placeholders are left for the host to expand (`skipParse`
+is dropped); switching that off restores strip-and-skip. Bound positives are always stripped
+(the registry already supplies the looks).
+
+## UI idea credit
+
+UI 아이디어 참고: japolino/inlay-illustrator (코드 미사용) — ideas only (panel structure,
+collapsible sections with summaries, tile gallery with a detail view, prompt preview); no
+code, markup, styles, strings or assets were used.
 
 ## Permissions and why each is needed
 
