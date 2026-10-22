@@ -778,3 +778,28 @@ Lumiverse 1.2.5 source checkout (read-only).
   the permission list minimal.
 - No handling of NAI PNG metadata import, manual (non-tag) generation panel, or Scene
   tool integration — all explicitly "2단계 (나중에)" in DESIGN.md.
+
+## 0.2.0 — negative prompt path (host evidence, Lumiverse staging checkout)
+
+- `src/services/image-gen.service.ts` `resolvePromptInput` (~1488-1530): `negativePrompt = opts.negativePrompt ?? preset.negativePrompt ?? settings.customNegativePrompt`;
+  `expandCharacterPromptMacro` (~1601-1650, splices the bound character/persona preset's prompt and
+  negative into `{{character_prompt}}`/`{{character_negative_prompt}}`/`{{persona_*}}`) runs only when
+  `!opts.skipParse` (~1504). With `skipParse` the macros stay literal in whatever reaches the provider.
+- Bound presets/bindings are not reachable from Spindle: `getMainImagePromptPresets` (~350) returns only
+  `kind: main` presets and `imageGenBindingsSvc` has no Spindle bridge (`src/spindle/worker-host-image-gen-api.ts`).
+  Hence 0.2.0 cannot resolve them itself; with `boundNegatives` on it keeps the two negative tokens and omits
+  `skipParse` so the host expands them (`promptMode:'custom'` alone keeps scene analysis off:
+  ~429 and ~1494 both resolve to custom). INFERRED, not seen on a live server: the host's behaviour when a token
+  has no binding (the code replaces it with an empty string).
+- `~515`: `if (promptResult.negativePrompt) params.negativePrompt = ...` — a non-empty negative reaches the provider.
+- `src/image-gen/providers/novelai.ts:131-133`: `negativePrompt = params.negativePrompt || <built-in default UC>` —
+  sending anything replaces the default. `:179-201`: for V4+ every character `uc` and every
+  `v4_negative_prompt.char_captions` entry gets the same global negative; `characterTags` items carry only
+  `{ tags }`, so per-character negatives can only be merged into the global one. The provider's parameter schema
+  default (`:77-79`) is a different, shorter string than the runtime fallback, so it is not used to pre-fill anything.
+
+## 0.2.0 — registry shape
+
+`{ id, names[], body, outfit, negative, enabled, legacyAppearance?, needsReview?, reviewTags? }`. 0.1.x records had
+`{ id, names[], appearance, enabled }`; `normalizeRegistry` splits `appearance` once (idempotent: a record that has a
+`body` or `outfit` key is never re-split). Per-scene outfit: `chars="Name: action | 옷: ..."` (core `splitAction`).
