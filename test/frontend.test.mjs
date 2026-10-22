@@ -635,3 +635,17 @@ test('redesign: the depth field only exists while the position is "depth"; max p
   assert.equal(h.frames.find((f) => f.type === 'save_settings').settings.maxImages, 1);
   h.stop();
 });
+
+test('redesign: the "older record" caveat shows only for records without a recorded composed prompt', async () => {
+  const imgs = [{ ...IMGS[0], recorded: true }, { id: 'p9', messageId: 'm9', status: 'ok', summary: '옛 그림', imageUrl: 'u', prompt: 'scene only', slots: ['a'] }];
+  const h = harness({ reply: withData({ list_images: { images: imgs } }) });
+  const modal = await h.open();
+  const thumbs = () => [...h.modal.root.walk()].filter((n) => (n.attrs.class || '') === 'lvil-thumb');
+  thumbs()[0].click();
+  assert.doesNotMatch(allText(h.modal.root), /이전 버전에서 그린 그림/);
+  btnText(h.modal.root, '← 목록').click();
+  thumbs()[1].click();
+  assert.match(allText(h.modal.root), /이전 버전에서 그린 그림/);
+  void modal;
+  h.stop();
+});

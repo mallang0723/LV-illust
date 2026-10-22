@@ -1141,6 +1141,7 @@ test('0.2.0: the composed prompt/negative and character negatives are recorded, 
   assert.equal(rec.negativePrompt, 'text, extra fingers');
   const { images } = await svc.runFrontendRequest({ type: 'list_images', chatId: 'c1' });
   assert.equal(images[0].prompt, '골목');
+  assert.equal(images[0].recorded, true);
   assert.equal(images[0].negative, 'text, extra fingers');
   assert.deepEqual(images[0].slots, ['1boy, silver hair, suit, smirking']);
   // regenerate: same negatives, even if the card's registry changed afterwards
