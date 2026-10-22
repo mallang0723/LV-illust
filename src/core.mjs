@@ -147,6 +147,155 @@ export function splitChars(charsRaw) {
 
 export const MAX_CHARS_PER_TAG = 6;
 
+// ---------------------------------------------------------------- tag lists + body/outfit split (0.2.0)
+
+// A character's looks are two separate tag groups: 신체 특성 (`body`: hair, eyes, skin,
+// build, species features ...) and 옷·장신구 (`outfit`: clothes, shoes, jewelry, glasses,
+// hats, worn/held items). Records saved before 0.2.0 only have one combined `appearance`
+// string; normalizeRegistry() migrates those with the conservative keyword heuristic below.
+
+const TAG_SEPARATORS = new Set([',', '，', '、', '\n', '\r']);
+
+/** Splits a comma-separated tag list into trimmed, non-empty tags. Commas inside
+ *  `()`/`[]`/`{}` or inside a NovelAI `weight::a, b::` group do NOT split, so weighted
+ *  groups stay in one piece. Joining the result with ", " loses no tag. */
+export function splitTagList(text) {
+  const s = String(text ?? '');
+  const out = [];
+  let depth = 0, weighted = false, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === ':' && s[i + 1] === ':') { weighted = !weighted; cur += '::'; i++; continue; }
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth = Math.max(0, depth - 1);
+    if (depth === 0 && !weighted && TAG_SEPARATORS.has(ch)) { out.push(cur); cur = ''; continue; }
+    cur += ch;
+  }
+  out.push(cur);
+  return out.map((t) => t.trim()).filter(Boolean);
+}
+
+export function joinTagList(tags) {
+  return (tags || []).map((t) => String(t ?? '').trim()).filter(Boolean).join(', ');
+}
+
+/** Case-insensitive, whitespace-insensitive de-duplication of comma-separated tag
+ *  fragments, keeping first-seen order and original spelling. */
+export function dedupeTags(fragments) {
+  const seen = new Set();
+  const out = [];
+  for (const frag of fragments || []) {
+    for (const tag of splitTagList(frag)) {
+      const key = tag.toLowerCase().replace(/\s+/g, ' ');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(tag);
+    }
+  }
+  return out;
+}
+
+// Keyword lists (exported so they can be reviewed and reported). Latin words match on
+// word boundaries with an optional plural; Korean words match as substrings (1-syllable
+// words only as a whole whitespace-separated token, to avoid matching inside other words).
+// A tag counts as outfit only when it has an outfit keyword and NO body keyword; a tag
+// with a body keyword and no outfit keyword is body; a tag with both, or with neither,
+// or with an AMBIGUOUS keyword is *unsure*: it goes to body and is flagged for review.
+export const OUTFIT_PRIORITY = [
+  'hair ornament', 'hair ribbon', 'hair bow', 'hair clip', 'hairclip', 'hairpin', 'hair pin', 'hairband', 'hair band',
+  'hair tie', 'hair flower', 'hair stick', 'hair accessory', 'hair accessories', 'hair scrunchie', 'hair bell', 'hair bobbles', 'hair beads',
+  'off shoulder', 'eyewear', 'eyepatch',
+  '머리띠', '머리핀', '머리끈', '귀걸이', '안경', '안대',
+];
+export const OUTFIT_WORDS = [
+  'dress', 'shirt', 't-shirt', 'tshirt', 'blouse', 'sweater', 'hoodie', 'jacket', 'coat', 'cardigan', 'vest', 'uniform', 'school uniform',
+  'suit', 'tuxedo', 'tie', 'necktie', 'bowtie', 'skirt', 'miniskirt', 'pants', 'jeans', 'shorts', 'trousers', 'leggings', 'thighhighs',
+  'thigh highs', 'kneehighs', 'stockings', 'pantyhose', 'tights', 'socks', 'shoes', 'boot', 'boots', 'sneakers', 'heels', 'high heels',
+  'sandals', 'loafers', 'gloves', 'glove', 'hat', 'cap', 'beret', 'hood', 'helmet', 'crown', 'tiara', 'ribbon', 'bow', 'scarf', 'shawl',
+  'cape', 'cloak', 'apron', 'kimono', 'yukata', 'hanbok', 'robe', 'armor', 'armour', 'bikini', 'swimsuit', 'leotard', 'lingerie', 'bra',
+  'panties', 'underwear', 'sleeves', 'collar', 'choker', 'necklace', 'pendant', 'earrings', 'ring', 'bracelet', 'bangle', 'anklet', 'belt',
+  'watch', 'glasses', 'sunglasses', 'monocle', 'mask', 'headband', 'scrunchie', 'headphones', 'headset', 'bag', 'backpack', 'umbrella', 'cane',
+  'corset', 'bodysuit', 'pajamas', 'jersey', 'maid headdress', 'wristband', 'harness', 'piercing', 'clothes', 'clothing', 'outfit', 'attire',
+  'costume', 'garment', 'sword', 'katana', 'wearing', 'dressed',
+  '옷', '셔츠', '블라우스', '니트', '스웨터', '후드', '재킷', '자켓', '코트', '가디건', '조끼', '정장', '교복', '유니폼', '드레스', '원피스',
+  '치마', '스커트', '바지', '청바지', '반바지', '레깅스', '스타킹', '양말', '신발', '구두', '부츠', '운동화', '샌들', '슬리퍼', '장갑', '모자',
+  '비니', '베레모', '선글라스', '목걸이', '반지', '팔찌', '발찌', '시계', '벨트', '넥타이', '스카프', '머플러', '목도리', '망토', '케이프',
+  '앞치마', '기모노', '한복', '로브', '갑옷', '비키니', '수영복', '속옷', '리본', '마스크', '가방', '우산', '지팡이', '초커', '왕관', '티아라', '가면',
+];
+export const BODY_WORDS = [
+  'hair', 'eye', 'pupil', 'iris', 'skin', 'tan', 'tanned', 'pale', 'complexion', 'muscular', 'muscle', 'slim', 'slender', 'thin', 'skinny',
+  'fat', 'chubby', 'plump', 'curvy', 'petite', 'tall', 'athletic', 'abs', 'toned', 'build', 'body', 'figure', 'height', 'breast', 'bust',
+  'chest', 'thigh', 'hip', 'waist', 'shoulders', 'scar', 'scarred', 'freckle', 'mole', 'birthmark', 'tattoo', 'fang', 'tooth', 'teeth',
+  'tail', 'horn', 'wing', 'ear', 'elf', 'demon', 'vampire', 'catgirl', 'cat girl', 'furry', 'ahoge', 'bangs', 'ponytail', 'twintails',
+  'twin tails', 'braid', 'bob cut', 'sidelocks', 'blonde', 'brunette', 'redhead', 'heterochromia',
+  'girl', 'boy', 'man', 'woman', 'male', 'female', '1girl', '1boy', '2girls', '2boys', 'solo', 'young', 'mature', 'adult', 'teen', 'teenage',
+  'child', 'old', 'elderly', 'youthful',
+  '머리카락', '머리', '눈동자', '피부', '체형', '근육', '흉터', '주근깨', '얼굴', '가슴', '허벅지', '꼬리', '날개', '나이', '머릿결', '곱슬', '생머리',
+  '단발', '장발', '포니테일', '쌍꼬리', '땋은',
+];
+export const BODY_WORDS_SINGLE_SYLLABLE = ['눈', '귀', '키', '몸', '뿔', '점'];
+export const AMBIGUOUS_WORDS = [
+  'bare shoulders', 'bare legs', 'bare arms', 'bare feet', 'barefoot', 'naked', 'nude', 'topless', 'bottomless', 'midriff', 'navel',
+  'cleavage', 'underboob', 'sideboob', 'see-through', '맨발', '알몸', '맨몸',
+];
+
+function wordRegex(list) {
+  const latin = list.filter((w) => /^[\x00-\x7f]+$/.test(w)).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '[ ]'));
+  const hangul = list.filter((w) => !/^[\x00-\x7f]+$/.test(w)).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const parts = [];
+  if (latin.length) parts.push(`(?<![a-z0-9])(?:${latin.join('|')})(?:e?s)?(?![a-z0-9])`);
+  if (hangul.length) parts.push(`(?:${hangul.join('|')})`);
+  return new RegExp(parts.join('|'), 'i');
+}
+const RE_PRIORITY = wordRegex(OUTFIT_PRIORITY);
+const RE_OUTFIT = wordRegex(OUTFIT_WORDS);
+const RE_BODY = wordRegex(BODY_WORDS);
+const RE_AMBIGUOUS = wordRegex(AMBIGUOUS_WORDS);
+
+function coreOfTag(tag) {
+  return String(tag)
+    .replace(/^\s*-?\d*\.?\d+::/, '').replace(/::\s*$/, '') // NAI weight wrapper
+    .replace(/:\s*-?\d*\.?\d+\s*\)?$/, '')                   // (tag:1.2)
+    .replace(/[(){}[\]]/g, ' ')
+    .replace(/[_-]/g, ' ')
+    .replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function classifyAtom(atom) {
+  if (!atom) return 'unsure';
+  if (RE_PRIORITY.test(atom)) return 'outfit';
+  if (RE_AMBIGUOUS.test(atom)) return 'unsure';
+  const koSingle = atom.split(' ').some((tok) => BODY_WORDS_SINGLE_SYLLABLE.includes(tok));
+  const body = RE_BODY.test(atom) || koSingle;
+  const outfit = RE_OUTFIT.test(atom);
+  if (body && outfit) return 'unsure';
+  if (body) return 'body';
+  if (outfit) return 'outfit';
+  return 'unsure';
+}
+
+/** 'body' | 'outfit' | 'unsure' for ONE tag (a weighted group with several inner tags
+ *  is 'body'/'outfit' only when every inner tag agrees). */
+export function classifyTag(tag) {
+  const parts = coreOfTag(tag).split(',').map((p) => p.trim()).filter(Boolean);
+  if (!parts.length) return 'unsure';
+  const kinds = parts.map(classifyAtom);
+  return kinds.every((k) => k === kinds[0]) ? kinds[0] : 'unsure';
+}
+
+/** Splits a combined appearance string: `{ body, outfit, review }` where each is an
+ *  array of the ORIGINAL tags (nothing is dropped or rewritten) and `review` lists
+ *  the unsure tags — which are ALSO in `body`. */
+export function splitAppearance(text) {
+  const body = [], outfit = [], review = [];
+  for (const tag of splitTagList(text)) {
+    const kind = classifyTag(tag);
+    if (kind === 'outfit') outfit.push(tag);
+    else { body.push(tag); if (kind === 'unsure') review.push(tag); }
+  }
+  return { body, outfit, review };
+}
+
 // ---------------------------------------------------------------- name matching (§2)
 
 export function normalizeName(s) {
@@ -202,34 +351,65 @@ export function findCharacterIndex(name, registry) {
 
 // ---------------------------------------------------------------- prompt assembly (F3/F5)
 
+// Per-scene outfit override inside a chars entry: "이름: 동작 | 옷: black suit, red tie"
+// (also `outfit:` / `옷=`). The `|`-separated part starting with 옷/outfit replaces the
+// character's SAVED outfit for this one picture only (body tags are never touched); with
+// no such part the saved outfit is used. Everything else stays the free-text action.
+const OUTFIT_PART_RE = /^\s*(?:옷|outfit)\s*[:=：]\s*/i;
+export function splitAction(action) {
+  const parts = String(action ?? '').split('|');
+  const rest = [];
+  let outfit = null;
+  for (const part of parts) {
+    if (OUTFIT_PART_RE.test(part)) outfit = part.replace(OUTFIT_PART_RE, '').trim();
+    else if (part.trim()) rest.push(part.trim());
+  }
+  return { action: rest.join(', '), outfit: outfit || null };
+}
+
+/** body / outfit of a registry record; a record that still only has the legacy combined
+ *  `appearance` (not normalized) counts entirely as body, so older callers keep working. */
+export function looksOf(ch) {
+  const hasSplit = typeof ch?.body === 'string' || typeof ch?.outfit === 'string';
+  if (hasSplit) return { body: ch.body || '', outfit: ch.outfit || '' };
+  return { body: typeof ch?.appearance === 'string' ? ch.appearance : '', outfit: '' };
+}
+
 /**
  * parsedChars: result of splitChars (already capped to MAX_CHARS_PER_TAG by caller).
  * registry: character registry array (see findCharacterIndex).
  * Returns:
  *  - characterTags: [{tags}] for NAI `parameters.characterTags` — ONLY matched+enabled
  *    characters (design §2: disabled characters match but contribute no appearance).
+ *    Tags are ordered: 신체 특성 (body), then 옷·장신구 (the scene's `옷:` override if the
+ *    tag gave one, else the saved outfit), then the scene action.
+ *  - negatives: those same characters' own negative tag lists (the host can only take
+ *    ONE global negative, so the caller merges these into it — see buildFinalPrompt).
  *  - extraFragments: short "name: action" text for matched-but-disabled or unmatched
  *    names, appended to the base scene prompt so the action isn't silently discarded
  *    even though no character-prompt slot is used for them.
  */
 export function buildCharacterTags(parsedChars, registry) {
   const characterTags = [];
+  const negatives = [];
   const extraFragments = [];
   for (const { name, action } of parsedChars.slice(0, MAX_CHARS_PER_TAG)) {
+    const { action: actionText, outfit: outfitOverride } = splitAction(action);
     const idx = findCharacterIndex(name, registry);
-    if (idx === -1) {
-      extraFragments.push(action ? `${name}: ${action}` : name);
-      continue;
-    }
+    const asFragment = () => {
+      const detail = [actionText, outfitOverride].filter(Boolean).join(', ');
+      extraFragments.push(detail ? `${name}: ${detail}` : name);
+    };
+    if (idx === -1) { asFragment(); continue; }
     const ch = registry[idx];
-    if (!ch.enabled) {
-      extraFragments.push(action ? `${name}: ${action}` : name);
-      continue;
-    }
-    const tags = [ch.appearance, action].filter(Boolean).join(', ');
+    if (!ch.enabled) { asFragment(); continue; }
+    const looks = looksOf(ch);
+    const outfit = outfitOverride ?? looks.outfit;
+    const tags = [looks.body, outfit, actionText].filter(Boolean).join(', ');
     characterTags.push({ tags });
+    if (typeof ch.negative === 'string' && ch.negative.trim()) negatives.push(ch.negative.trim());
   }
-  return { characterTags, extraFragments };
+  return { characterTags, extraFragments, negatives };
 }
 
 export function assemblePrompt(basePrompt, extraFragments) {
@@ -290,12 +470,40 @@ export function joinPromptParts(parts) {
  * caller can omit the field entirely and let the host's own connection-default
  * fallback apply exactly as it did before this fix.
  */
-export function buildFinalPrompt(scenePrompt, mainPreset) {
-  const presetPositive = mainPreset?.prompt ? stripCharacterPersonaMacros(mainPreset.prompt) : '';
+const BOUND_POSITIVE_RE = /\{\{\s*(?:character|persona)_prompt\s*\}\}/gi;
+const BOUND_NEGATIVE_RE = /\{\{\s*(?:character|persona)_negative_prompt\s*\}\}/gi;
+
+/**
+ * 0.2.0 — the final negative prompt is composed in this order, then de-duplicated
+ * (case-insensitive, per comma-separated tag, first spelling wins):
+ *   1. the active main preset's negative (cleaned),
+ *   2. `commonNegative` (the extension's own 공통 네거티브 setting),
+ *   3. the negatives of the characters that appear in the scene (`characterNegatives`).
+ * It is sent explicitly whenever it is non-empty (so the host can never fall back to a raw
+ * preset negative with unresolved macros); when everything is empty it is `undefined`
+ * and the caller omits the field, leaving the host/provider default in force.
+ *
+ * Card- and persona-bound negatives ({{character_negative_prompt}} /
+ * {{persona_negative_prompt}} in the preset): the host resolves the bindings, and only when
+ * the request is NOT sent with `skipParse` (image-gen.service.ts resolvePromptInput). Spindle
+ * exposes neither the bound presets nor the bindings, so we cannot resolve them ourselves.
+ * With `opts.boundNegatives === true` those two tokens are therefore left in the negative for
+ * the host to expand (the caller must then omit `skipParse`); otherwise they are stripped.
+ * Bound POSITIVES ({{character_prompt}} / {{persona_prompt}}) are always stripped: the
+ * registry's body/outfit tags already supply the character's looks, so splicing a bound
+ * snippet in as well would duplicate it.
+ */
+export function buildFinalPrompt(scenePrompt, mainPreset, opts = {}) {
+  const presetPositive = mainPreset?.prompt ? String(mainPreset.prompt).replace(BOUND_POSITIVE_RE, '') : '';
   const prompt = joinPromptParts([presetPositive, scenePrompt]);
-  const rawNegative = mainPreset?.negativePrompt ? stripCharacterPersonaMacros(mainPreset.negativePrompt) : '';
-  const cleanedNegative = joinPromptParts([rawNegative]); // same leading/trailing-comma cleanup as the positive side
-  return { prompt, negativePrompt: cleanedNegative || undefined };
+  let presetNegative = mainPreset?.negativePrompt ? String(mainPreset.negativePrompt) : '';
+  presetNegative = opts.boundNegatives === true ? presetNegative : presetNegative.replace(BOUND_NEGATIVE_RE, '');
+  const negative = dedupeTags([
+    joinPromptParts([presetNegative]), // same leading/trailing-comma cleanup as the positive side
+    opts.commonNegative,
+    ...(opts.characterNegatives || []),
+  ]).join(', ');
+  return { prompt, negativePrompt: negative || undefined };
 }
 
 // ---------------------------------------------------------------- markers (F2/F5)
@@ -426,16 +634,16 @@ export function planMessage(content, { registry = [], maxImages = 2, existingIma
     }
     validCount++;
     const parsedChars = splitChars(tag.charsRaw);
-    const { characterTags, extraFragments } = buildCharacterTags(parsedChars, registry);
+    const { characterTags, extraFragments, negatives } = buildCharacterTags(parsedChars, registry);
     const prompt = assemblePrompt(tag.promptRaw, extraFragments);
     const id = nextImageId(usedIds, idGenerator);
     usedIds.push(id);
     if (validCount > maxImages) {
       markers.set(i, { mode: 'replace', text: renderSkippedMarker(id, tag) });
-      skipped.push({ tagIndex: i, id, prompt, characterTags, summary: tag.promptRaw });
+      skipped.push({ tagIndex: i, id, prompt, characterTags, negatives, summary: tag.promptRaw });
       return;
     }
-    jobs.push({ tagIndex: i, id, prompt, characterTags, summary: tag.promptRaw });
+    jobs.push({ tagIndex: i, id, prompt, characterTags, negatives, summary: tag.promptRaw });
   });
   return { tags, jobs, skipped, markers };
 }
@@ -519,11 +727,14 @@ export function markerRegexForId(id) {
 
 // ---------------------------------------------------------------- F1 instruction injection
 
+export const MAX_NEGATIVE_LEN = 2000;
 export const DEFAULT_SETTINGS = {
   position: 'depth', // 'start' | 'end' | 'depth'
   depth: 4,
   role: 'system',
   maxImages: 2,
+  commonNegative: '', // 공통 네거티브: added to every picture's negative prompt (0.2.0)
+  boundNegatives: true, // let the host append the card/persona-bound negative (see buildFinalPrompt)
 };
 
 export function normalizeSettings(raw) {
@@ -532,6 +743,8 @@ export function normalizeSettings(raw) {
   if (!['system', 'user', 'assistant'].includes(s.role)) s.role = DEFAULT_SETTINGS.role;
   s.depth = Number.isInteger(s.depth) && s.depth >= 0 ? s.depth : DEFAULT_SETTINGS.depth;
   s.maxImages = Number.isInteger(s.maxImages) && s.maxImages >= 1 && s.maxImages <= 2 ? s.maxImages : DEFAULT_SETTINGS.maxImages;
+  s.commonNegative = typeof s.commonNegative === 'string' ? s.commonNegative.replace(/\s+/g, ' ').trim().slice(0, MAX_NEGATIVE_LEN) : '';
+  s.boundNegatives = s.boundNegatives !== false;
   return s;
 }
 
@@ -572,6 +785,7 @@ export function buildInstructionText(registry) {
     '그림이 필요한 장면에서는 답변 중간에 다음 형식의 태그를 한 번 써라(최대 2개): ' +
     '<pic chars="이름1, 이름2" prompt="장면/구도/배경 묘사">. ' +
     '인물별 동작·표정이 필요하면 chars="이름1: 동작1; 이름2: 동작2" 형식을 써라. ' +
+    '그 장면에서만 옷이 저장된 옷과 다르면 동작 뒤에 | 옷: 옷·장신구 를 덧붙여라(예: chars="이름1: 동작1 | 옷: black suit, red tie"). 안 쓰면 저장된 옷이 쓰인다. ' +
     '태그는 평문처럼 자연스럽게 섞어 써도 되고, 등장인물 목록에 없는 이름을 써도 된다.' +
     roster
   );
@@ -595,12 +809,66 @@ export function injectInstruction(messages, settings, registry) {
 
 // ---------------------------------------------------------------- registry (F4) normalization
 
+/**
+ * Registry record shape (0.2.0):
+ *   { id, names[], body, outfit, negative, enabled, legacyAppearance?, needsReview?, reviewTags? }
+ * Records saved by 0.1.x have a single combined `appearance` string and none of
+ * `body`/`outfit`: those are split ONCE here (idempotent — a record that already has a
+ * `body` or `outfit` key is never re-split). Nothing is lost: every original tag lands in
+ * `body` or `outfit`, and the untouched original string is kept as `legacyAppearance`
+ * (the panel can restore it). Ambiguous tags go to `body`, are listed in `reviewTags`
+ * and set `needsReview` until the user confirms the character in the panel.
+ */
 export function normalizeRegistry(raw) {
   const list = raw && Array.isArray(raw.characters) ? raw.characters : [];
-  return list.map((c, i) => ({
-    id: typeof c?.id === 'string' && c.id ? c.id : 'c' + i,
-    names: Array.isArray(c?.names) ? c.names.filter((n) => typeof n === 'string' && n.trim()) : [],
-    appearance: typeof c?.appearance === 'string' ? c.appearance : '',
-    enabled: c?.enabled !== false,
-  })).filter((c) => c.names.length > 0);
+  const out = list.map((c, i) => {
+    const names = Array.isArray(c?.names) ? c.names.filter((n) => typeof n === 'string' && n.trim()) : [];
+    const rec = {
+      id: typeof c?.id === 'string' && c.id ? c.id : '',
+      names,
+      body: '', outfit: '',
+      negative: typeof c?.negative === 'string' ? c.negative.replace(/\s+/g, ' ').trim().slice(0, MAX_NEGATIVE_LEN) : '',
+      enabled: c?.enabled !== false,
+    };
+    const hasSplit = typeof c?.body === 'string' || typeof c?.outfit === 'string';
+    if (hasSplit) {
+      rec.body = typeof c.body === 'string' ? c.body : '';
+      rec.outfit = typeof c.outfit === 'string' ? c.outfit : '';
+      if (typeof c.legacyAppearance === 'string' && c.legacyAppearance.trim()) rec.legacyAppearance = c.legacyAppearance;
+      const tags = Array.isArray(c.reviewTags) ? c.reviewTags.filter((t) => typeof t === 'string' && t.trim()) : [];
+      if (c.needsReview === true) { rec.needsReview = true; rec.reviewTags = tags; }
+    } else if (typeof c?.appearance === 'string' && c.appearance.trim()) {
+      const sp = splitAppearance(c.appearance);
+      rec.body = joinTagList(sp.body);
+      rec.outfit = joinTagList(sp.outfit);
+      rec.legacyAppearance = c.appearance;
+      if (sp.review.length) { rec.needsReview = true; rec.reviewTags = sp.review; }
+    }
+    return rec;
+  }).filter((c) => c.names.length > 0);
+  // ids: keep stored ones, give the rest the first free "cN" (a deleted row's number is
+  // never handed to a new character that way)
+  const used = new Set(out.map((c) => c.id).filter(Boolean));
+  let n = 0;
+  for (const c of out) {
+    if (c.id) continue;
+    while (used.has('c' + n)) n++;
+    c.id = 'c' + n; used.add(c.id);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- prompt preview (0.2.0)
+
+/** Pure, I/O-free version of what a `<pic chars=".." prompt="..">` tag turns into: the
+ *  scene prompt, the NAI per-character tag slots and the composed negative. Used by the
+ *  panel's prompt preview — it never generates anything. */
+export function composeScene({ chars = '', scene = '', registry = [], mainPreset = null, settings = {} } = {}) {
+  const { characterTags, extraFragments, negatives } = buildCharacterTags(splitChars(chars), registry);
+  const { prompt, negativePrompt } = buildFinalPrompt(assemblePrompt(scene, extraFragments), mainPreset, {
+    commonNegative: settings.commonNegative,
+    characterNegatives: negatives,
+    boundNegatives: settings.boundNegatives !== false,
+  });
+  return { prompt, negativePrompt: negativePrompt || '', characterTags, extraFragments };
 }

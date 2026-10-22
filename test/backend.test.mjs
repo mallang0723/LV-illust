@@ -261,7 +261,7 @@ test('save_settings + load_settings round-trip through storage', async () => {
   const svc = createService(f.api);
   await svc.runFrontendRequest({ type: 'save_settings', settings: { position: 'end', depth: 0, role: 'user', maxImages: 1 } });
   const { settings } = await svc.runFrontendRequest({ type: 'load_settings' });
-  assert.deepEqual(settings, { position: 'end', depth: 0, role: 'user', maxImages: 1 });
+  assert.deepEqual(settings, { position: 'end', depth: 0, role: 'user', maxImages: 1, commonNegative: '', boundNegatives: true });
 });
 
 test('save_registry + load_registry round-trip through character extensions, never pre-seeded', async () => {
