@@ -386,3 +386,252 @@ test('a timed-out or failed load never leaves the panel blank: the other section
   assert.match(allText(modal.root.querySelector('.lvil-loadfail')), /설정/);
   h.stop();
 });
+
+// ---------------------------------------------------------------- 0.2.0 redesign
+
+const F = await import('../src/frontend.mjs');
+const REG2 = [
+  { id: 'c0', names: ['아드리안', 'Adrian'], body: '1boy, silver hair', outfit: 'black coat, white gloves', negative: 'extra fingers', enabled: true },
+  { id: 'c1', names: ['정수빈'], body: '1girl, mystery tag', outfit: 'school uniform', negative: '', enabled: true,
+    legacyAppearance: '1girl, school uniform, mystery tag', needsReview: true, reviewTags: ['mystery tag'] },
+];
+const IMGS = [
+  { id: 'p1', messageId: 'm1', status: 'ok', summary: '골목', imageUrl: 'u1', prompt: 'masterpiece, alley', negative: 'lowres', slots: ['1boy, silver hair'] },
+  { id: 'p2', messageId: 'm2', status: 'orphan', summary: '밤', imageUrl: 'u2', reason: '메시지가 바뀌어 넣지 못함' },
+];
+const withData = (extra = {}) => (p) => ({ load_registry: { registry: REG2 }, list_images: { images: IMGS }, ...extra }[p.type]);
+// the DOM stand-in keeps string `value` attributes in attrs only; a real input reflects them
+const syncNames = (root) => { for (const n of root.walk()) if (n.tagName === 'INPUT' && n.attrs['aria-label'] === '이름과 별칭') n.value = n.attrs.value ?? n.value; };
+const btnText = (root, text) => root.find((n) => n.tagName === 'BUTTON' && n.textContent === text);
+
+test('view helpers: one-line summaries for the section badges', () => {
+  assert.equal(F.settingsSummary({ position: 'depth', depth: 4, maxImages: 2 }), '깊이 4 · 2장');
+  assert.equal(F.settingsSummary({ position: 'start', depth: 4, maxImages: 1 }), '맨 앞 · 1장');
+  assert.equal(F.settingsSummary(null), '');
+  assert.equal(F.registrySummary([]), '비어 있음');
+  assert.equal(F.registrySummary(REG2), '2명 · 확인 1');
+  assert.equal(F.registrySummary([REG2[0]]), '1명');
+  assert.equal(F.imagesSummary([]), '없음');
+  assert.equal(F.imagesSummary(IMGS), '2장 · 확인 1');
+  assert.equal(F.imagesSummary([IMGS[0]]), '1장');
+  assert.equal(F.tagCount('a, b, 1.2::c, d::'), 3);
+});
+
+test('registryWithDrafts: unsaved edits are layered over the saved registry; nameless rows are left out', () => {
+  const out = F.registryWithDrafts([...REG2, { names: [], body: '', outfit: '', negative: '', enabled: true }], { 0: { outfit: 'suit', names: '아드리안, A' }, 2: { names: '새 인물', body: 'tall' } });
+  assert.deepEqual(out.map((c) => c.names), [['아드리안', 'A'], ['정수빈'], ['새 인물']]);
+  assert.equal(out[0].outfit, 'suit');
+  assert.equal(out[0].body, '1boy, silver hair');
+  assert.equal(out[2].body, 'tall');
+});
+
+test('resplitLooks: re-runs the same heuristic over body + outfit text, nothing dropped', () => {
+  const r = F.resplitLooks('1girl, red dress, silver hair', 'glasses, mystery');
+  assert.equal(r.outfit, 'red dress, glasses');
+  assert.equal(r.body, '1girl, silver hair, mystery');
+  assert.deepEqual(r.review, ['mystery']);
+});
+
+test('copyText: never throws without a secure context — falls back, then reports failure', async () => {
+  assert.equal(await F.copyText('x', null, {}), false); // no clipboard, no document
+  assert.equal(await F.copyText('x', null, { clipboard: { writeText: async () => {} } }), true);
+  const bad = { clipboard: { writeText: async () => { throw new Error('NotAllowed'); } } };
+  assert.equal(await F.copyText('x', null, bad), false);
+  const made = [];
+  const doc = { body: { append: (n) => made.push(n) }, execCommand: (c) => c === 'copy', createElement: () => ({ setAttribute() {}, style: {}, select() {}, remove() {} }) };
+  assert.equal(await F.copyText('x', doc, bad), true); // clipboard denied -> legacy path
+  assert.equal(made.length, 1);
+});
+
+test('source guard: the panel code never touches crypto.* or navigator.clipboard directly (clipboard only through the guarded copyText)', async () => {
+  const raw = await (await import('node:fs/promises')).readFile(new URL('../src/frontend.mjs', import.meta.url), 'utf8');
+  const src = raw.split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n'); // comments don't count
+  assert.doesNotMatch(src, /crypto\./);
+  assert.doesNotMatch(src, /navigator\.clipboard/);
+  for (const m of src.matchAll(/\.clipboard\b/g)) assert.match(src.slice(Math.max(0, m.index - 20), m.index), /nav( &&|\b)/);
+});
+
+test('redesign: four collapsible sections each carry a summary badge, and the overview shows chips', async () => {
+  const h = harness({ reply: withData() });
+  const modal = await h.open();
+  const toggles = [...modal.root.walk()].filter((n) => (n.attrs.class || '') === 'lvil-sec-toggle');
+  assert.deepEqual(toggles.map((t) => t.attrs['data-section']), ['images', 'registry', 'preview', 'settings']);
+  const text = allText(modal.root);
+  assert.match(text, /2장 · 확인 1/); // images badge
+  assert.match(text, /2명 · 확인 1/); // registry badge
+  assert.match(text, /깊이 4 · 2장/); // settings badge
+  assert.match(text, /답변당 최대 2장/);
+  h.stop();
+});
+
+test('redesign: clicking a section header toggles aria-expanded and the body hidden flag', async () => {
+  const h = harness({ reply: withData() });
+  const modal = await h.open();
+  const tog = () => [...h.modal.root.walk()].find((n) => n.attrs['data-section'] === 'settings');
+  assert.equal(tog().attrs['aria-expanded'], 'false');
+  tog().click();
+  assert.equal(tog().attrs['aria-expanded'], 'true');
+  const bodyOf = (t) => { for (const n of h.modal.root.walk()) if (n.children.includes(t)) return n; return null; };
+  void modal; void bodyOf;
+  h.stop();
+});
+
+test('redesign: a migrated character shows the "확인해 주세요" hint with the ambiguous tag and the original; saving clears the flag and sends the split fields', async () => {
+  const h = harness({ reply: (p) => {
+    if (p.type === 'save_registry') return { registry: p.registry };
+    return withData()(p);
+  } });
+  const modal = await h.open();
+  const text = allText(modal.root);
+  assert.match(text, /확인해 주세요/);
+  assert.match(text, /mystery tag/);
+  assert.match(text, /1girl, school uniform, mystery tag/); // the untouched original stays visible
+  const saveBtns = [...modal.root.walk()].filter((n) => n.tagName === 'BUTTON' && n.textContent === '저장');
+  syncNames(modal.root);
+  saveBtns[1].click(); // second character (the flagged one)
+  await flush();
+  const saved = h.frames.find((f) => f.type === 'save_registry');
+  assert.equal(saved.registry[1].needsReview, false);
+  assert.equal(saved.registry[1].body, '1girl, mystery tag');
+  assert.equal(saved.registry[1].outfit, 'school uniform');
+  assert.equal(saved.registry[1].legacyAppearance, '1girl, school uniform, mystery tag'); // original not discarded
+  assert.equal(saved.registry[0].outfit, 'black coat, white gloves'); // other characters untouched
+  assert.ok(!('appearance' in saved.registry[0]));
+  h.stop();
+});
+
+test('redesign: body, outfit and negative are separate fields; editing one never touches the other', async () => {
+  const h = harness({ reply: withData() });
+  const modal = await h.open();
+  const ta = (label) => [...modal.root.walk()].filter((n) => n.tagName === 'TEXTAREA' && n.attrs['aria-label'] === label);
+  assert.equal(ta('신체 특성').length, 2);
+  assert.equal(ta('옷·장신구').length, 2);
+  assert.equal(ta('이 인물의 네거티브').length, 2);
+  ta('옷·장신구')[0].value = 'suit';
+  for (const f of ta('옷·장신구')[0].listeners.input || []) f({ target: ta('옷·장신구')[0] });
+  syncNames(modal.root);
+  btnText(modal.root, '저장').click();
+  await flush();
+  const saved = h.frames.find((f) => f.type === 'save_registry');
+  assert.equal(saved.registry[0].outfit, 'suit');
+  assert.equal(saved.registry[0].body, '1boy, silver hair');
+  h.stop();
+});
+
+test('redesign: "신체/옷 자동 나누기" re-splits the drafts with the migration heuristic (not saved until 저장)', async () => {
+  const h = harness({ reply: withData() });
+  const modal = await h.open();
+  const body = [...modal.root.walk()].find((n) => n.tagName === 'TEXTAREA' && n.attrs['aria-label'] === '신체 특성');
+  body.value = '1boy, silver hair, black coat';
+  for (const f of body.listeners.input || []) f({ target: body });
+  const before = h.frames.length;
+  [...modal.root.walk()].find((n) => n.tagName === 'BUTTON' && n.textContent === '신체/옷 자동 나누기').click();
+  await flush();
+  assert.equal(h.frames.slice(before).some((f) => f.type === 'save_registry'), false);
+  const again = [...h.modal.root.walk()].find((n) => n.tagName === 'TEXTAREA' && n.attrs['aria-label'] === '신체 특성');
+  assert.equal(again.value, '1boy, silver hair');
+  const out = [...h.modal.root.walk()].find((n) => n.tagName === 'TEXTAREA' && n.attrs['aria-label'] === '옷·장신구');
+  assert.equal(out.value, 'black coat, white gloves');
+  h.stop();
+});
+
+test('redesign: deleting a character needs a second tap (no accidental loss)', async () => {
+  const h = harness({ reply: withData() });
+  const modal = await h.open();
+  const del = () => [...h.modal.root.walk()].filter((n) => n.tagName === 'BUTTON' && /^(삭제|한 번 더 눌러 삭제)$/.test(n.textContent))[0];
+  del().click();
+  await flush();
+  assert.equal(h.frames.some((f) => f.type === 'save_registry'), false);
+  assert.equal(del().textContent, '한 번 더 눌러 삭제');
+  del().click();
+  await flush();
+  const saved = h.frames.find((f) => f.type === 'save_registry');
+  assert.deepEqual(saved.registry.map((c) => c.id), ['c1']);
+  void modal;
+  h.stop();
+});
+
+test('redesign: tapping a picture opens a detail view with the sent prompt/negative/slots and a back button; orphans get no regenerate there', async () => {
+  const h = harness({ reply: withData() });
+  const modal = await h.open();
+  const thumbs = () => [...h.modal.root.walk()].filter((n) => (n.attrs.class || '') === 'lvil-thumb');
+  assert.equal(thumbs().length, 2);
+  thumbs()[0].click();
+  let text = allText(h.modal.root);
+  assert.match(text, /masterpiece, alley/);
+  assert.match(text, /lowres/);
+  assert.match(text, /1\. 1boy, silver hair/);
+  assert.ok(btnText(h.modal.root, '다시 그리기'), 'a normal image can be regenerated from its detail view');
+  btnText(h.modal.root, '← 목록').click();
+  assert.equal(thumbs().length, 2);
+  thumbs()[1].click(); // the orphan
+  text = allText(h.modal.root);
+  assert.match(text, /메시지가 바뀌어 넣지 못함/);
+  assert.equal(btnText(h.modal.root, '다시 그리기'), null, 'orphan detail: status/reason only');
+  void modal;
+  h.stop();
+});
+
+test('redesign: the prompt preview sends the chars/scene and the UNSAVED draft registry, and renders positive, slots and negative', async () => {
+  const h = harness({ reply: withData({ preview_prompt: { prompt: 'masterpiece, 골목', negativePrompt: 'lowres, extra fingers', characterTags: [{ tags: '1boy, suit' }], hasMainPreset: true } }) });
+  const modal = await h.open();
+  const inputs = (label) => [...modal.root.walk()].find((n) => n.tagName === 'INPUT' && n.attrs['aria-label'] === label);
+  const chars = inputs('인물(chars)'), scene = inputs('장면 프롬프트');
+  chars.value = '아드리안: 미소 | 옷: suit'; for (const f of chars.listeners.input || []) f({ target: chars });
+  scene.value = '골목'; for (const f of scene.listeners.input || []) f({ target: scene });
+  // an unsaved outfit edit must be what the preview uses
+  const outfit = [...modal.root.walk()].find((n) => n.tagName === 'TEXTAREA' && n.attrs['aria-label'] === '옷·장신구');
+  outfit.value = 'draft outfit'; for (const f of outfit.listeners.input || []) f({ target: outfit });
+  btnText(modal.root, '미리보기').click();
+  await flush();
+  const req = h.frames.find((f) => f.type === 'preview_prompt');
+  assert.equal(req.chars, '아드리안: 미소 | 옷: suit');
+  assert.equal(req.scene, '골목');
+  assert.equal(req.characterId, 'ch1');
+  assert.equal(req.registry[0].outfit, 'draft outfit');
+  const text = allText(h.modal.root);
+  assert.match(text, /masterpiece, 골목/);
+  assert.match(text, /1\. 1boy, suit/);
+  assert.match(text, /lowres, extra fingers/);
+  assert.match(text, /기본 네거티브는 대체/); // tells the user a sent negative replaces the host default
+  h.stop();
+});
+
+test('redesign: an empty composed negative says the host default stays in force', async () => {
+  const h = harness({ reply: withData({ preview_prompt: { prompt: 'x', negativePrompt: '', characterTags: [], hasMainPreset: false } }) });
+  const modal = await h.open();
+  btnText(modal.root, '미리보기').click();
+  await flush();
+  assert.match(allText(h.modal.root), /호스트의 기본 네거티브가 그대로 쓰입니다/);
+  h.stop();
+});
+
+test('redesign: 공통 네거티브 is applied through save_settings with the other settings kept; bound-negative switch toggles boundNegatives', async () => {
+  const settings = { position: 'depth', depth: 4, role: 'system', maxImages: 2, commonNegative: '', boundNegatives: true };
+  const h = harness({ reply: (p) => (p.type === 'load_settings' ? { settings } : p.type === 'save_settings' ? { settings: p.settings } : undefined) });
+  const modal = await h.open();
+  const neg = [...modal.root.walk()].find((n) => n.tagName === 'TEXTAREA' && n.attrs['aria-label'] === '공통 네거티브');
+  neg.value = 'lowres, text';
+  for (const f of neg.listeners.input || []) f({ target: neg });
+  btnText(modal.root, '적용').click();
+  await flush();
+  const saved = h.frames.filter((f) => f.type === 'save_settings').at(-1);
+  assert.equal(saved.settings.commonNegative, 'lowres, text');
+  assert.equal(saved.settings.boundNegatives, true);
+  assert.equal(saved.settings.position, 'depth');
+  const bound = [...h.modal.root.walk()].filter((n) => n.tagName === 'BUTTON' && /켜짐 \(끄기\)/.test(n.textContent)).at(-1);
+  bound.click();
+  await flush();
+  assert.equal(h.frames.filter((f) => f.type === 'save_settings').at(-1).settings.boundNegatives, false);
+  h.stop();
+});
+
+test('redesign: the depth field only exists while the position is "depth"; max pictures is a 1/2 segmented control', async () => {
+  const h = harness({ reply: (p) => (p.type === 'load_settings' ? { settings: { position: 'end', depth: 4, role: 'system', maxImages: 2 } } : undefined) });
+  const modal = await h.open();
+  assert.equal([...modal.root.walk()].some((n) => n.tagName === 'INPUT' && n.attrs['aria-label'] === '깊이'), false);
+  btnText(modal.root, '1장').click();
+  await flush();
+  assert.equal(h.frames.find((f) => f.type === 'save_settings').settings.maxImages, 1);
+  h.stop();
+});

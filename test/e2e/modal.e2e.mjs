@@ -112,6 +112,11 @@ window.__ready = true;
 </script></body></html>`;
 
 async function controlsReport(page) {
+  // 0.2.0: sections/character cards are collapsible — expand everything first so every
+  // control is actually on screen (a control inside a collapsed section is not tappable
+  // by design, it is not hidden-by-accident).
+  await page.evaluate(() => { for (const b of document.querySelectorAll('.lvil [aria-expanded=false]')) b.click(); });
+  await page.waitForTimeout(100);
   return page.evaluate(() => {
     const out = [];
     for (const n of document.querySelectorAll('[data-spindle-modal] button, [data-spindle-modal] select, [data-spindle-modal] input, [data-spindle-modal] textarea')) {
