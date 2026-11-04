@@ -27,6 +27,9 @@ function harness({ reply, characterId = 'ch1' } = {}) {
     load_registry: { registry: [] },
     load_auto: { auto: true },
     list_images: { images: [] },
+    load_gallery: { characterId, imageIds: [], reason: characterId ? '' : '캐릭터가 없는 채팅에서는 갤러리에 저장할 수 없습니다.' },
+    gallery_pending: { jobs: [] },
+    finish_gallery: {},
     save_settings: { settings: { position: 'depth', depth: 4, role: 'system', maxImages: 2 } },
     save_registry: { registry: [] },
     set_auto: { auto: false },
@@ -648,4 +651,131 @@ test('redesign: the "older record" caveat shows only for records without a recor
   assert.match(allText(h.modal.root), /이전 버전에서 그린 그림/);
   void modal;
   h.stop();
+});
+
+const galleryImage = { id: 'p1', imageId: 'stored-image', messageId: 'm1', status: 'ok', imageUrl: '/api/v1/images/stored-image' };
+const galleryButton = (h) => h.modal.root.querySelector('.lvil-gallery-save');
+async function openGalleryDetail(h) {
+  await h.open();
+  h.modal.root.querySelector('.lvil-thumb').click();
+  return galleryButton(h);
+}
+
+test('gallery detail: existing link shows saved and disabled without writing', async () => {
+  const h = harness({ reply: (p) => ({
+    list_images: { images: [galleryImage] },
+    load_gallery: { characterId: 'ch1', imageIds: ['stored-image'] },
+  }[p.type]) });
+  const button = await openGalleryDetail(h);
+  assert.equal(button.textContent, '갤러리에 저장됨');
+  assert.equal(button.disabled, true);
+  button.click();
+  assert.equal(h.frames.filter((p) => p.type === 'prepare_gallery').length, 0);
+  h.stop();
+});
+
+test('gallery detail: double click issues one POST, shows pending then saved, works without randomUUID', async (t) => {
+  let complete, posts = 0;
+  t.mock.method(globalThis, 'fetch', async () => { posts++; return new Promise((resolve) => { complete = resolve; }); });
+  const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: undefined });
+  const h = harness({ reply: (p) => ({
+    list_images: { images: [galleryImage] },
+    prepare_gallery: { characterId: 'ch1', token: 'claim' },
+  }[p.type]) });
+  try {
+    const button = await openGalleryDetail(h);
+    button.click(); button.click();
+    await flush();
+    assert.equal(posts, 1);
+    assert.equal(galleryButton(h).textContent, '갤러리에 저장 중…');
+    assert.equal(galleryButton(h).disabled, true);
+    complete({ ok: true });
+    await flush();
+    assert.equal(galleryButton(h).textContent, '갤러리에 저장됨');
+    assert.equal(galleryButton(h).disabled, true);
+    assert.equal(h.status(), '갤러리에 저장됨');
+    assert.equal(h.frames.find((p) => p.type === 'prepare_gallery').imageId, 'stored-image');
+  } finally { h.stop(); Object.defineProperty(globalThis, 'crypto', cryptoDescriptor); }
+});
+
+for (const status of [403, 500]) {
+  test(`gallery detail: HTTP ${status} displays Korean error and enables retry`, async (t) => {
+    t.mock.method(globalThis, 'fetch', async () => ({ ok: false, status }));
+    const h = harness({ reply: (p) => ({
+      list_images: { images: [galleryImage] },
+      prepare_gallery: { characterId: 'ch1', token: 'claim' },
+    }[p.type]) });
+    try {
+      (await openGalleryDetail(h)).click();
+      await flush();
+      assert.match(h.status(), new RegExp(`갤러리 저장 실패.*${status}`));
+      assert.equal(galleryButton(h).disabled, false);
+      assert.equal(h.frames.find((p) => p.type === 'finish_gallery').saved, false);
+    } finally { h.stop(); }
+  });
+}
+
+for (const [name, characterId, reason] of [
+  ['no character', null, '캐릭터가 없는 채팅에서는 갤러리에 저장할 수 없습니다.'],
+  ['group chat', 'representative', '그룹 채팅에서는 갤러리에 저장할 수 없습니다.'],
+]) {
+  test(`gallery detail: ${name} disables saving and explains why`, async () => {
+    const h = harness({ characterId, reply: (p) => ({
+      list_images: { images: [galleryImage] },
+      load_gallery: { characterId: null, imageIds: [], reason },
+    }[p.type]) });
+    try {
+      const button = await openGalleryDetail(h);
+      assert.equal(button.disabled, true);
+      assert.ok(h.modal.root.find((n) => n.textContent === reason));
+      button.click();
+      assert.equal(h.frames.filter((p) => p.type === 'prepare_gallery').length, 0);
+    } finally { h.stop(); }
+  });
+}
+
+test('gallery detail: URL without stored image ID cannot be linked', async () => {
+  const h = harness({ reply: (p) => p.type === 'list_images' ? { images: [{ ...galleryImage, imageId: undefined }] } : undefined });
+  try {
+    assert.equal((await openGalleryDetail(h)).disabled, true);
+    assert.ok(h.modal.root.find((n) => /이미지 ID가 없어/.test(n.textContent)));
+  } finally { h.stop(); }
+});
+
+test('auto gallery setting defaults OFF and saves opt-in independently of auto-generation', async () => {
+  const h = harness();
+  try {
+    await h.open();
+    const button = h.modal.root.find((n) => n.attrs['aria-label'] === '생성 시 자동으로 갤러리에 저장');
+    assert.equal(button.attrs['aria-checked'], 'false');
+    button.click();
+    await flush();
+    assert.equal(h.frames.find((p) => p.type === 'save_settings').settings.autoSaveGallery, true);
+    assert.equal(h.frames.filter((p) => p.type === 'set_auto').length, 0);
+  } finally { h.stop(); }
+});
+
+test('automatic saves run with modal closed, dedupe already-saved jobs and isolate a failed POST', async (t) => {
+  const posted = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const id = JSON.parse(options.body).image_id;
+    posted.push(id);
+    return { ok: id !== 'failed', status: id === 'failed' ? 500 : 201 };
+  });
+  let loaded = false;
+  const h = harness({ reply: (p) => {
+    if (p.type === 'gallery_pending') {
+      if (loaded) return { jobs: [] };
+      loaded = true;
+      return { jobs: ['already-linked', 'failed', 'success'].map((imageId) => ({ chatId: 'c1', imageId })) };
+    }
+    if (p.type === 'prepare_gallery') return { characterId: 'ch1', saved: p.imageId === 'already-linked', token: p.imageId };
+  } });
+  try {
+    await flush();
+    assert.equal(h.modal, null);
+    assert.deepEqual(posted, ['failed', 'success']);
+    assert.equal(h.frames.filter((p) => p.type === 'finish_gallery' && p.saved).length, 1);
+  } finally { h.stop(); }
 });

@@ -21,6 +21,95 @@ const AUTO_VAR_KEY = 'lv_illust.auto';
 const ORPHAN_VAR_KEY = 'lv_illust.orphans';
 const MAX_ORPHANS = 20;
 
+// Only the logged-in frontend can POST gallery links. Persist automatic work per
+// acting user, and serialize claims across all of that worker's frontend sessions.
+// These operations never hold up illustration delivery or rewrite message metadata.
+const galleryWorkers = new WeakMap();
+function galleryWorker(api) {
+  if (!galleryWorkers.has(api)) galleryWorkers.set(api, { tail: Promise.resolve(), leases: new Map(), seq: 0 });
+  return galleryWorkers.get(api);
+}
+function galleryExclusive(api, fn) {
+  const state = galleryWorker(api);
+  const result = state.tail.then(fn, fn);
+  state.tail = result.catch(() => {});
+  return result;
+}
+const galleryQueuePath = (userId) => `gallery-pending-${encodeURIComponent(userId || 'installer')}.json`;
+async function galleryPending(api, userId) {
+  const value = await api.storage.getJson(galleryQueuePath(userId), { fallback: [] });
+  return Array.isArray(value) ? value : [];
+}
+async function galleryTarget(api, chatId, userId) {
+  const chat = await api.chats.get(chatId, withUser(userId));
+  if (chat?.metadata?.group === true) return { characterId: null, reason: '그룹 채팅에서는 갤러리에 저장할 수 없습니다.' };
+  if (!chat?.character_id) return { characterId: null, reason: '캐릭터가 없는 채팅에서는 갤러리에 저장할 수 없습니다.' };
+  return { characterId: chat.character_id, reason: '' };
+}
+async function galleryItems(api, characterId, userId) {
+  if (typeof api.characters.getGallery !== 'function') throw new Error('갤러리를 확인할 수 없습니다. 루미버스 업데이트가 필요합니다.');
+  const items = await api.characters.getGallery(characterId, withUser(userId));
+  if (!Array.isArray(items)) throw new Error('갤러리 목록을 확인하지 못했습니다.');
+  return items;
+}
+function scheduleGallery(api, { chatId, imageId, settings, userId }) {
+  if (!settings?.autoSaveGallery || typeof imageId !== 'string' || !imageId.trim()) return;
+  void galleryExclusive(api, async () => {
+    const target = await galleryTarget(api, chatId, userId);
+    if (!target.characterId) return;
+    const pending = await galleryPending(api, userId);
+    if (!pending.some((p) => p.characterId === target.characterId && p.imageId === imageId)) {
+      await api.storage.setJson(galleryQueuePath(userId), [...pending, { chatId, characterId: target.characterId, imageId }]);
+    }
+    api.sendToFrontend({ type: 'gallery_pending' }, withUser(userId));
+  }).catch(() => {
+    try { api.sendToFrontend({ type: 'gallery_error', error: '갤러리 자동 저장을 준비하지 못했습니다. 그림에서 직접 저장해 주세요.' }, withUser(userId)); } catch { /* delivery stays independent */ }
+  });
+}
+
+async function prepareGallery(api, payload, userId) {
+  const target = await galleryTarget(api, payload.chatId, userId);
+  if (!target.characterId) throw new Error(target.reason);
+  const imageId = payload.imageId;
+  if (typeof imageId !== 'string' || !imageId.trim()) throw new Error('저장된 이미지 ID가 없습니다.');
+  const pending = await galleryPending(api, userId);
+  const queued = pending.some((p) => p.chatId === payload.chatId && p.characterId === target.characterId && p.imageId === imageId);
+  if (!queued) {
+    const messages = await api.chat.getMessages(payload.chatId);
+    const records = (messages || []).flatMap((m) => Object.values(m.metadata?.[IDENTIFIER]?.images || {}));
+    records.push(...await loadOrphans(api, payload.chatId));
+    if (!records.some((r) => r.imageId === imageId)) throw new Error('이 채팅의 그림을 찾을 수 없습니다.');
+  }
+  const items = await galleryItems(api, target.characterId, userId);
+  if (items.some((item) => item.image_id === imageId)) {
+    await api.storage.setJson(galleryQueuePath(userId), pending.filter((p) => p.characterId !== target.characterId || p.imageId !== imageId));
+    return { ...target, saved: true };
+  }
+  const state = galleryWorker(api);
+  for (const [key, lease] of state.leases) if (lease.until <= Date.now()) state.leases.delete(key);
+  const key = JSON.stringify([userId || '', target.characterId, imageId]);
+  const lease = state.leases.get(key);
+  if (lease && lease.until > Date.now()) throw new Error('다른 창에서 갤러리에 저장 중입니다. 잠시 후 다시 시도해 주세요.');
+  const token = `gallery-${Date.now()}-${++state.seq}`;
+  state.leases.set(key, { token, until: Date.now() + 60000 });
+  return { ...target, imageId, token };
+}
+
+async function finishGallery(api, payload, userId) {
+  const state = galleryWorker(api);
+  const key = JSON.stringify([userId || '', payload.characterId, payload.imageId]);
+  if (state.leases.get(key)?.token !== payload.token) return {};
+  try {
+    if (payload.saved) {
+      const items = await galleryItems(api, payload.characterId, userId);
+      if (!items.some((item) => item.image_id === payload.imageId)) throw new Error('갤러리 저장을 확인하지 못했습니다.');
+      const pending = await galleryPending(api, userId);
+      await api.storage.setJson(galleryQueuePath(userId), pending.filter((p) => p.characterId !== payload.characterId || p.imageId !== payload.imageId));
+    }
+    return {};
+  } finally { state.leases.delete(key); }
+}
+
 function extToRegistry(character) {
   return normalizeRegistry(character?.extensions?.[IDENTIFIER]);
 }
@@ -239,6 +328,7 @@ async function generateImage(api, { chatId, prompt, characterTags, negatives, se
   if (!result || typeof result.imageUrl !== 'string' || !result.imageUrl) {
     throw new Error('이미지 URL을 받지 못함(생성 결과에 사용 가능한 그림 없음)');
   }
+  scheduleGallery(api, { chatId, imageId: result.imageId, settings, userId });
   return { ...result, composed: { prompt: finalPrompt, negativePrompt: negativePrompt || '' } };
 }
 
@@ -562,6 +652,17 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
 
   async function runFrontendRequest(payload, userId) {
     switch (payload.type) {
+      case 'load_gallery': {
+        const target = await galleryTarget(api, payload.chatId, userId);
+        const items = target.characterId ? await galleryItems(api, target.characterId, userId) : [];
+        return { ...target, imageIds: items.map((item) => item.image_id) };
+      }
+      case 'gallery_pending':
+        return galleryExclusive(api, async () => ({ jobs: await galleryPending(api, userId) }));
+      case 'prepare_gallery':
+        return galleryExclusive(api, () => prepareGallery(api, payload, userId));
+      case 'finish_gallery':
+        return galleryExclusive(api, () => finishGallery(api, payload, userId));
       case 'load_status':
         return { missing: await missingPermissions(api) };
       case 'load_settings':
@@ -581,7 +682,7 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
           const images = m.metadata?.[IDENTIFIER]?.images;
           if (!images) continue;
           for (const [id, rec] of Object.entries(images)) {
-            out.push({ id, messageId: m.id, status: rec.status, summary: rec.summary, imageUrl: rec.imageUrl, ...promptDetails(rec) });
+            out.push({ id, ...(rec.imageId ? { imageId: rec.imageId } : {}), messageId: m.id, status: rec.status, summary: rec.summary, imageUrl: rec.imageUrl, ...promptDetails(rec) });
           }
         }
         // Orphaned generations (review finding 1: produced but couldn't be spliced back
@@ -590,7 +691,7 @@ export function createService(api, { idGenerator, lockTimeoutMs, generateTimeout
         // nothing a generation actually produced is silently lost.
         const orphans = await loadOrphans(api, payload.chatId);
         for (const o of orphans) {
-          out.push({ id: o.id, messageId: o.messageId, status: 'orphan', summary: o.summary, imageUrl: o.imageUrl, reason: o.reason, ...promptDetails(o) });
+          out.push({ id: o.id, ...(o.imageId ? { imageId: o.imageId } : {}), messageId: o.messageId, status: 'orphan', summary: o.summary, imageUrl: o.imageUrl, reason: o.reason, ...promptDetails(o) });
         }
         return { images: out };
       }
