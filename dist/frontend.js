@@ -736,6 +736,7 @@ export const DEFAULT_SETTINGS = {
   maxImages: 2,
   commonNegative: '', // 공통 네거티브: added to every picture's negative prompt (0.2.0)
   boundNegatives: true, // let the host append the card/persona-bound negative (see buildFinalPrompt)
+  autoSaveGallery: false,
 };
 
 export function normalizeSettings(raw) {
@@ -746,6 +747,7 @@ export function normalizeSettings(raw) {
   s.maxImages = Number.isInteger(s.maxImages) && s.maxImages >= 1 && s.maxImages <= 2 ? s.maxImages : DEFAULT_SETTINGS.maxImages;
   s.commonNegative = typeof s.commonNegative === 'string' ? s.commonNegative.replace(/\s+/g, ' ').trim().slice(0, MAX_NEGATIVE_LEN) : '';
   s.boundNegatives = s.boundNegatives !== false;
+  s.autoSaveGallery = s.autoSaveGallery === true;
   return s;
 }
 
@@ -883,9 +885,10 @@ export function composeScene({ chars = '', scene = '', registry = [], mainPreset
 //   프롬프트 미리보기 (what a <pic> tag would send, nothing is generated),
 //   설정 (instruction placement, max pictures, 공통 네거티브, bound negatives).
 // Free APIs only: registerInputBarAction, showModal, getActiveChat, events.on,
-// state.subscribe. All writes go through the backend worker (sendToBackend/onBackendMessage).
+// state.subscribe. Gallery links use the host's same-origin, cookie-authenticated REST API;
+// other writes go through the backend worker (sendToBackend/onBackendMessage).
 //
-// Each of the four loads (settings / auto flag / registry / image list) is independent:
+// Each load (settings / auto flag / registry / image list / gallery state) is independent:
 // a failing one only disables its OWN section's controls, is named in the status line
 // with a "다시 시도" button, and — when it failed for lack of a permission — is retried
 // automatically as soon as the host reports a permission change (backend push
@@ -902,6 +905,7 @@ const LOADS = {
   auto: { type: 'load_auto', label: '자동 생성 상태' },
   registry: { type: 'load_registry', label: '인물 등록부' },
   images: { type: 'list_images', label: '그림 목록' },
+  gallery: { type: 'load_gallery', label: '갤러리 상태' },
 };
 const SECTION_NAMES = Object.keys(LOADS);
 const PERMISSION_LABELS = {
@@ -920,6 +924,29 @@ const PREVIEW_BOUND_NEG_RE = /\{\{\s*(?:character|persona)_negative_prompt\s*\}\
 // ---- pure view helpers (exported for tests) ---------------------------------------
 
 export const tagCount = (text) => splitTagList(text).length;
+
+/** Same auth/body convention as the host frontend's api/client.ts. */
+export async function postGalleryLink(characterId, imageId, { fetchImpl = globalThis.fetch, signal } = {}) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, 15000);
+  try {
+    const response = await fetchImpl(`/api/v1/characters/${encodeURIComponent(characterId)}/gallery/link`, {
+      method: 'POST', credentials: 'include', signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ image_id: imageId }),
+    });
+    if (!response.ok) throw new Error(`갤러리 저장 실패 (HTTP ${response.status}). 로그인 상태와 권한을 확인하고 다시 시도해 주세요.`);
+  } catch (error) {
+    if (error?.message?.startsWith('갤러리 저장 실패')) throw error;
+    throw new Error(controller.signal.aborted ? '갤러리 저장 시간이 초과되었거나 취소되었습니다. 다시 시도해 주세요.' : '갤러리 저장 실패: 서버에 연결하지 못했습니다. 다시 시도해 주세요.');
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
 
 export function settingsSummary(s) {
   if (!s) return '';
@@ -1078,6 +1105,9 @@ export function setup(ctx) {
   let loadToken = 0;
   const pending = new Map();
   const timers = new Set();
+  const galleryAbort = new AbortController();
+  const gallerySaves = new Map();
+  let drainingGallery = false, galleryAgain = false;
   // view.chatId/characterId are the SNAPSHOT this panel's data actually belongs to
   // (captured once per open(), not the live, possibly-already-moved-on outer
   // chatId/characterId vars) — every write (save/toggle/regenerate) targets these, not
@@ -1090,6 +1120,7 @@ export function setup(ctx) {
     loads: freshLoads(), missing: [], drafts: {}, chatId: null, characterId: null,
     openChars: {}, armedDelete: -1, detailId: null,
     previewDraft: { chars: '', scene: '' }, preview: null, negativeDraft: null,
+    gallery: { characterId: null, imageIds: [], reason: '' },
   };
 
   const action = ctx.ui.registerInputBarAction({ id: 'lv-illust', label: '삽화가 설정', iconSvg: ICON, enabled: false });
@@ -1106,6 +1137,8 @@ export function setup(ctx) {
     });
   }
   const offBackend = ctx.onBackendMessage((r) => {
+    if (r?.type === 'gallery_pending' && !r.requestId) { drainGallery(); return; }
+    if (r?.type === 'gallery_error' && !r.requestId) { setStatus(r.error, 'err'); return; }
     if (r && r.type === 'permissions_changed' && !r.requestId) { onPermissionsChanged(); return; }
     const fn = r && pending.get(r.requestId);
     if (!fn) return;
@@ -1145,6 +1178,7 @@ export function setup(ctx) {
       if (name === 'registry') { view.registry = Array.isArray(r.registry) ? r.registry : []; view.drafts = {}; }
       if (name === 'auto') view.auto = r.auto;
       if (name === 'images') view.images = Array.isArray(r.images) ? r.images : [];
+      if (name === 'gallery') view.gallery = { characterId: r.characterId || null, imageIds: r.imageIds || [], reason: r.reason || '' };
       Object.assign(ld, { state: 'ok', error: '', permission: '' });
     } else {
       Object.assign(ld, { state: r.permission ? 'perm' : 'error', error: r.error || '불러오지 못함', permission: r.permission || '' });
@@ -1189,6 +1223,54 @@ export function setup(ctx) {
     if (r.ok) { view.settings = r.settings; view.negativeDraft = null; }
     render();
     setStatus(r.ok ? '설정 저장됨' : failText(r), r.ok ? 'ok' : 'err');
+  }
+
+  function saveGallery(targetChatId, imageId) {
+    const key = JSON.stringify([targetChatId, imageId]);
+    if (gallerySaves.has(key)) return gallerySaves.get(key);
+    const task = (async () => {
+      let claim;
+      try {
+        claim = await request({ type: 'prepare_gallery', chatId: targetChatId, imageId });
+        if (!claim.ok) throw new Error(claim.error || '갤러리 저장을 준비하지 못했습니다.');
+        if (!alive) return;
+        if (!claim.saved) {
+          await postGalleryLink(claim.characterId, imageId, { signal: galleryAbort.signal });
+          // A lost acknowledgement is safe: the next attempt checks the gallery first.
+          await request({ type: 'finish_gallery', characterId: claim.characterId, imageId, token: claim.token, saved: true });
+        }
+        if (alive && view.chatId === targetChatId) {
+          if (view.gallery.characterId === claim.characterId && !view.gallery.imageIds.includes(imageId)) view.gallery.imageIds.push(imageId);
+          setStatus('갤러리에 저장됨', 'ok');
+        }
+      } catch (error) {
+        if (alive && claim?.token) await request({ type: 'finish_gallery', characterId: claim.characterId, imageId, token: claim.token, saved: false });
+        if (alive) setStatus(error?.message?.startsWith('갤러리 저장 실패') ? error.message : `갤러리 저장 실패: ${error?.message || '다시 시도해 주세요.'}`, 'err');
+      } finally {
+        gallerySaves.delete(key);
+        if (alive) render();
+      }
+    })();
+    gallerySaves.set(key, task);
+    render();
+    return task;
+  }
+
+  async function drainGallery() {
+    if (!alive) return;
+    if (drainingGallery) { galleryAgain = true; return; }
+    drainingGallery = true;
+    try {
+      do {
+        galleryAgain = false;
+        const r = await request({ type: 'gallery_pending' });
+        if (!alive) return;
+        for (const job of r.ok ? r.jobs || [] : []) {
+          if (!alive) return;
+          await saveGallery(job.chatId, job.imageId);
+        }
+      } while (alive && galleryAgain);
+    } finally { drainingGallery = false; }
   }
 
   async function toggleAuto() {
@@ -1366,6 +1448,10 @@ export function setup(ctx) {
 
   function detailView(img) {
     const isOrphan = img.status === 'orphan';
+    const saved = view.gallery.imageIds.includes(img.imageId);
+    const saving = gallerySaves.has(JSON.stringify([view.chatId, img.imageId]));
+    const galleryReason = !sectionOk('gallery') ? '갤러리 상태를 먼저 불러와야 합니다.'
+      : view.gallery.reason || (!img.imageId ? '저장된 이미지 ID가 없어 갤러리에 저장할 수 없습니다.' : '');
     const block = (title, text, what) => el('div', { class: 'lvil-block' },
       el('div', { class: 'lvil-blockhead' }, el('span', { class: 'lvil-label', text: title }),
         text ? el('button', { type: 'button', text: '복사', 'aria-label': `${title} 복사`, on: { click: () => copy(text, what) } }) : null),
@@ -1376,6 +1462,11 @@ export function setup(ctx) {
         STATUS_PILL[img.status] ? el('span', { class: 'lvil-chip', text: STATUS_PILL[img.status] }) : null),
       img.imageUrl ? el('img', { src: img.imageUrl, alt: img.summary || '그림' }) : el('div', { class: 'lvil-noimg', text: '이미지 없음' }),
       el('div', { text: img.summary || img.id }),
+      el('button', { type: 'button', class: 'lvil-gallery-save', disabled: saved || saving || !!galleryReason || view.busy,
+        text: saved ? '갤러리에 저장됨' : saving ? '갤러리에 저장 중…' : '갤러리에 저장',
+        on: { click: () => { if (!saved && !saving && !galleryReason && !view.busy) saveGallery(view.chatId, img.imageId); } } }),
+      galleryReason ? el('div', { class: 'lvil-note', text: galleryReason }) : null,
+      sectionState('gallery'),
       isOrphan ? el('div', { class: 'lvil-reason', text: img.reason || '넣지 못함' }) : null,
       block('보낸 프롬프트', img.prompt, '프롬프트'),
       block('네거티브 프롬프트', img.negative, '네거티브'),
@@ -1529,6 +1620,10 @@ export function setup(ctx) {
       text: s.boundNegatives !== false ? '켜짐 (끄기)' : '꺼짐 (켜기)', on: { click: () => saveSettings({ boundNegatives: s.boundNegatives === false }) } });
     return section('settings', '⚙️ 설정 (계정 전체)', sectionOk('settings') ? settingsSummary(view.settings) : '',
       sectionState('settings'),
+      field('생성 시 자동으로 갤러리에 저장', el('button', { type: 'button', class: 'lvil-switch', role: 'switch',
+        'aria-label': '생성 시 자동으로 갤러리에 저장', 'aria-checked': String(s.autoSaveGallery === true), 'data-active': String(s.autoSaveGallery === true), disabled: dis,
+        text: s.autoSaveGallery === true ? '켜짐 (끄기)' : '꺼짐 (켜기)', on: { click: () => saveSettings({ autoSaveGallery: s.autoSaveGallery !== true }) } }),
+        '기본 꺼짐. 캐릭터가 있는 1:1 채팅의 새 그림과 다시 그린 그림을 저장합니다. 실패해도 그림은 전달되며, 대기 중인 저장은 패널을 다시 열 때 재시도합니다.'),
       field('AI 지시문 위치', el('div', { class: 'lvil-row' }, posSel, depthInput), '답변을 쓰기 전에 AI에게 "그림 태그를 써라"는 지시를 끼워 넣는 자리입니다.'),
       field('지시 역할', roleSel),
       field('답변당 최대 그림', maxSeg),
@@ -1564,9 +1659,11 @@ export function setup(ctx) {
       loads: freshLoads(), missing: [], drafts: {},
       chatId, characterId, status: '', kind: '',
       openChars: {}, armedDelete: -1, detailId: null, preview: null, negativeDraft: null,
+      gallery: { characterId: null, imageIds: [], reason: '' },
     });
     render();
     await loadSections(token, SECTION_NAMES);
+    drainGallery();
   }
 
   const offClick = action.onClick(() => { open(); });
@@ -1577,9 +1674,11 @@ export function setup(ctx) {
   // scoped to this extension, so it only ever triggers "retry what failed".
   try { offs.push(ctx.events.on('SPINDLE_PERMISSION_CHANGED', () => onPermissionsChanged())); } catch { /* optional */ }
   refreshActive();
+  drainGallery();
 
   return () => {
     alive = false;
+    galleryAbort.abort();
     for (const f of offs) { try { f(); } catch { /* ignore */ } }
     try { offClick(); } catch { /* ignore */ }
     offBackend();
@@ -1587,6 +1686,7 @@ export function setup(ctx) {
     if (permTimer) clearTimeout(permTimer);
     for (const t of timers) clearTimeout(t);
     timers.clear();
+    for (const resolve of pending.values()) resolve({ ok: false, error: '확장이 종료되었습니다.' });
     pending.clear();
     action.destroy();
   };

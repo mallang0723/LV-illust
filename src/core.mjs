@@ -735,6 +735,7 @@ export const DEFAULT_SETTINGS = {
   maxImages: 2,
   commonNegative: '', // 공통 네거티브: added to every picture's negative prompt (0.2.0)
   boundNegatives: true, // let the host append the card/persona-bound negative (see buildFinalPrompt)
+  autoSaveGallery: false,
 };
 
 export function normalizeSettings(raw) {
@@ -745,6 +746,7 @@ export function normalizeSettings(raw) {
   s.maxImages = Number.isInteger(s.maxImages) && s.maxImages >= 1 && s.maxImages <= 2 ? s.maxImages : DEFAULT_SETTINGS.maxImages;
   s.commonNegative = typeof s.commonNegative === 'string' ? s.commonNegative.replace(/\s+/g, ' ').trim().slice(0, MAX_NEGATIVE_LEN) : '';
   s.boundNegatives = s.boundNegatives !== false;
+  s.autoSaveGallery = s.autoSaveGallery === true;
   return s;
 }
 
