@@ -25,6 +25,13 @@ Lumiverse's own main/style prompt presets, per-card presets, and auto-scene gene
 left untouched — this extension only adds "in-reply picture tags" + "per-character
 appearance registry," nothing Lumiverse already does natively.
 
+## What's new in 0.3.1-v1
+
+The injected illustration instruction and roster header are now English. Scene prompts,
+actions and outfits must use short English NovelAI-style tags, while character names and
+aliases remain unchanged. The instruction uses `settings.maxImages` (1 or 2; default 2).
+Outfit examples use `| outfit:`; the parser still accepts `| 옷:` as well.
+
 ## What's new in 0.2.0
 
 **Panel redesign.** An overview card (status line, summary chips, this chat's auto-generate
@@ -59,7 +66,7 @@ is dropped); switching that off restores strip-and-skip. Bound positives are alw
 
 ## UI idea credit
 
-UI 아이디어 참고: japolino/inlay-illustrator (코드 미사용) — ideas only (panel structure,
+UI 아이디어 참고: inlay-illustrator (코드 미사용) — ideas only (panel structure,
 collapsible sections with summaries, tile gallery with a detail view, prompt preview); no
 code, markup, styles, strings or assets were used.
 

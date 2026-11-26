@@ -159,7 +159,7 @@ test('planMessage jobs carry the scene characters\' negatives', () => {
 });
 
 test('instruction text tells the AI about the per-scene outfit syntax', () => {
-  assert.ok(C.buildInstructionText(REG).includes('| 옷:'));
+  assert.ok(C.buildInstructionText(REG, C.DEFAULT_SETTINGS.maxImages).includes('| outfit:'));
 });
 
 // ---------------------------------------------------------------- negative composition
@@ -227,3 +227,15 @@ test('composeScene: preview of what a tag becomes (positive, negative, per-chara
   assert.deepEqual(r.characterTags, [{ tags: '1boy, silver hair, suit, smirking' }]);
   assert.equal(C.composeScene({ scene: 'x' }).negativePrompt, '');
 });
+
+for (const keyword of ['옷', 'outfit']) {
+  test(`outfit override: parser accepts | ${keyword}: in a complete pic tag`, () => {
+    const registry = [{ names: ['인물1'], body: '1girl, short hair', outfit: 'white coat', enabled: true }];
+    const { jobs } = C.planMessage(`<pic chars="인물1: smiling | ${keyword}: black suit, red tie" prompt="office, upper body">`, {
+      registry, maxImages: 1, idGenerator: () => 'p1',
+    });
+    assert.equal(jobs.length, 1);
+    assert.deepEqual(jobs[0].characterTags, [{ tags: '1girl, short hair, black suit, red tie, smiling' }]);
+    assert.equal(registry[0].outfit, 'white coat');
+  });
+}

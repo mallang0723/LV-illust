@@ -775,20 +775,25 @@ export function instructionNameList(registry) {
     .filter(Boolean);
 }
 
-export function buildInstructionText(registry) {
+export function buildInstructionText(registry, maxImages) {
+  const limit = Number.isInteger(maxImages) && maxImages >= 1 ? maxImages : DEFAULT_SETTINGS.maxImages;
   const names = instructionNameList(registry);
   // Roster lines are presented as quoted data (each alias wrapped in literal quotes),
   // not as free-form instruction text, so a sanitized-but-still-plain-looking alias
   // can't be read as part of the instruction's own sentence structure.
   const roster = names.length
-    ? `\n등장인물 목록(따옴표 안 글자 그대로 사용 가능, 아무 별칭이나 써도 됨):\n- ${names.join('\n- ')}`
+    ? `\nCharacter list (use any alias exactly as written inside the quotes):\n- ${names.join('\n- ')}`
     : '';
   return (
-    '그림이 필요한 장면에서는 답변 중간에 다음 형식의 태그를 한 번 써라(최대 2개): ' +
-    '<pic chars="이름1, 이름2" prompt="장면/구도/배경 묘사">. ' +
-    '인물별 동작·표정이 필요하면 chars="이름1: 동작1; 이름2: 동작2" 형식을 써라. ' +
-    '그 장면에서만 옷이 저장된 옷과 다르면 동작 뒤에 | 옷: 옷·장신구 를 덧붙여라(예: chars="이름1: 동작1 | 옷: black suit, red tie"). 안 쓰면 저장된 옷이 쓰인다. ' +
-    '태그는 평문처럼 자연스럽게 섞어 써도 되고, 등장인물 목록에 없는 이름을 써도 된다.' +
+    `When a scene would benefit from an illustration, insert one tag mid-reply in this exact format (max ${limit} per reply): ` +
+    '<pic chars="Name1, Name2" prompt="scene, composition, background">. ' +
+    'For per-character actions or expressions, use chars="Name1: action1; Name2: action2". ' +
+    "If a character's outfit in that scene differs from their saved outfit, append | outfit: clothing, accessories after the action " +
+    '(e.g. chars="Name1: action1 | outfit: black suit, red tie"); otherwise the saved outfit is used. ' +
+    'Write everything inside the tag — prompt, actions, outfits — in English, as short comma-separated NovelAI-style tags ' +
+    '(e.g. "dimly lit office, rain on window, from side, upper body"), even when the reply itself is in another language. ' +
+    'Keep character names exactly as they appear in the story. ' +
+    'You may weave the tag naturally into the prose, and you may use names not on the character list.' +
     roster
   );
 }
@@ -801,7 +806,7 @@ export function buildInstructionText(registry) {
  */
 export function injectInstruction(messages, settings, registry) {
   const list = Array.isArray(messages) ? messages.slice() : [];
-  const msg = { role: settings.role, content: buildInstructionText(registry) };
+  const msg = { role: settings.role, content: buildInstructionText(registry, settings.maxImages) };
   if (settings.position === 'start') { list.unshift(msg); return list; }
   if (settings.position === 'end') { list.push(msg); return list; }
   const idx = Math.max(0, list.length - settings.depth);

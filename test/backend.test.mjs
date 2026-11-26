@@ -1180,3 +1180,18 @@ test('0.2.0: legacy combined-appearance cards load split, flagged for review, or
   assert.equal(saved.registry[0].legacyAppearance, '1boy, silver hair, black coat, mystery');
   assert.equal('appearance' in f.calls.filter((c) => c[0] === 'characters.update').at(-1)[2].extensions.lv_illust.characters[0], false);
 });
+
+for (const maxImages of [1, 2]) {
+  test(`interceptor: English instruction uses persisted maxImages=${maxImages} at system depth 4`, async () => {
+    const f = fakeApi();
+    const svc = createService(f.api);
+    await svc.runFrontendRequest({ type: 'save_settings', settings: { maxImages } });
+    svc.registerInterceptor();
+    const messages = Array.from({ length: 5 }, () => ({ role: 'user', content: 'scene' }));
+    const out = await f.api.runInterceptor(messages, { chatId: 'c1', characterId: null });
+    assert.equal(out.length, 6);
+    assert.equal(out[1].role, 'system');
+    assert.ok(out[1].content.startsWith('When a scene would benefit from an illustration,'));
+    assert.ok(out[1].content.includes(`(max ${maxImages} per reply)`));
+  });
+}
