@@ -691,3 +691,56 @@ test('REGRESSION (review bonus): an embedded quote in an alias cannot break the 
   assert.ok(text.includes('"보라장난꾼"')); // quote stripped, not left to break out of the "..." wrapper
   assert.ok(!text.includes('"보라"장난꾼"'));
 });
+
+// ---------------------------------------------------------------- self-closing pic tags
+
+for (const ending of [' />', '/>', ' / >', '\t/\n>']) {
+  test(`parseTags: self-closing ending ${JSON.stringify(ending)} includes the complete tag span`, () => {
+    const raw = `<pic chars="Character 1" prompt="office, upper body"${ending}`;
+    const content = `before ${raw} after`;
+    const tags = C.parseTags(content);
+    assert.deepEqual(tags, [{
+      start: 7, end: 7 + raw.length, raw, malformed: false,
+      charsRaw: 'Character 1', promptRaw: 'office, upper body',
+    }]);
+    assert.equal(C.applyMarkers(content, tags, new Map([[0, { mode: 'replace', text: '[image]' }]])), 'before [image] after');
+  });
+}
+
+test('planMessage: mixed normal and self-closing tags replace fully, including overflow', () => {
+  const content = 'A <pic prompt="one" /> B <pic prompt="two"> C <pic prompt="three"/> D <pic prompt="four" / > E';
+  const { tags, jobs, markers } = C.planMessage(content, { maxImages: 2, idGenerator: counterIdGen() });
+  assert.deepEqual(tags.map((tag) => tag.malformed), [false, false, false, false]);
+  assert.deepEqual(jobs.map((job) => job.tagIndex), [0, 1]);
+  for (const job of jobs) markers.set(job.tagIndex, { mode: 'replace', text: `[image ${job.id}]` });
+  const out = C.applyMarkers(content, tags, markers);
+  assert.equal(out, `A [image p1] B [image p2] C ${C.renderSkippedMarker('p3', tags[2])} D ${C.renderSkippedMarker('p4', tags[3])} E`);
+  assert.deepEqual(C.parseTags(out), []);
+});
+
+for (const raw of [
+  '<pic prompt="broken" /', '<pic prompt="broken" //>', '<pic prompt="broken" / x>',
+  '<pic prompt="broken" / chars="Character 1">', '<pic prompt=broken />',
+  '<pic prompt="unfinished />', '<pic foo="bar" />',
+]) {
+  test(`malformed self-closing tag remains recoverable and does not swallow the next tag: ${raw}`, () => {
+    const content = `before ${raw} middle <pic prompt="valid" /> after`;
+    const plan = C.planMessage(content, { idGenerator: counterIdGen() });
+    assert.deepEqual(plan.tags.map((tag) => tag.malformed), [true, false]);
+    assert.deepEqual(plan.jobs.map((job) => job.tagIndex), [1]);
+    assert.equal(plan.markers.get(0).mode, 'insert');
+    const annotated = C.applyMarkers(content, plan.tags, plan.markers);
+    assert.equal(annotated.replace(C.MALFORMED_MARKER_TEXT, ''), content);
+    const again = C.planMessage(annotated);
+    assert.equal(C.applyMarkers(annotated, again.tags, again.markers), annotated);
+    plan.markers.set(1, { mode: 'replace', text: '[image]' });
+    assert.equal(C.applyMarkers(content, plan.tags, plan.markers),
+      `before <pic${C.MALFORMED_MARKER_TEXT}${raw.slice(4)} middle [image] after`);
+  });
+}
+
+test('parseTags: slash and greater-than inside quoted values remain attribute data', () => {
+  const [tag] = C.parseTags('<pic prompt="sign /> on wall, / path" />');
+  assert.equal(tag.malformed, false);
+  assert.equal(tag.promptRaw, 'sign /> on wall, / path');
+});

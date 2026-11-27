@@ -25,6 +25,13 @@ Lumiverse's own main/style prompt presets, per-card presets, and auto-scene gene
 left untouched — this extension only adds "in-reply picture tags" + "per-character
 appearance registry," nothing Lumiverse already does natively.
 
+## What's new in 0.3.1-v2
+
+Self-closing `<pic ... />`, `<pic .../>`, and `<pic ... / >` tags now work like normal
+`<pic ...>` tags. Replacement consumes the entire tag, including the closing slash and
+bracket. Malformed tags still retain their original text with an error annotation.
+The English illustration instruction is unchanged.
+
 ## What's new in 0.3.1-v1
 
 The injected illustration instruction and roster header are now English. Scene prompts,

@@ -17,7 +17,7 @@ const KEY_CHAR = /[\w-]/;
 // Hand-written scanner instead of a single greedy regex: a naive `<pic[^>]*>` match
 // over-consumes when a broken tag's unterminated quote lets `[^>]*` swallow a *later*,
 // genuinely well-formed tag's `>`. Scanning char-by-char lets us stop at the first thing
-// that isn't `whitespace* key="value"` or the closing `>`, so a broken tag never eats
+// that isn't `whitespace* key="value"` or a closing `>` / `/ >`, so a broken tag never eats
 // a real one that follows it.
 function scanTag(text, openIdx) {
   let i = openIdx + 4; // past '<pic'
@@ -26,6 +26,11 @@ function scanTag(text, openIdx) {
     while (i < text.length && WS.test(text[i])) i++;
     if (i >= text.length) return { ok: false };
     if (text[i] === '>') return { ok: true, end: i + 1, attrs };
+    if (text[i] === '/') {
+      i++;
+      while (i < text.length && WS.test(text[i])) i++;
+      return text[i] === '>' ? { ok: true, end: i + 1, attrs } : { ok: false };
+    }
     if (!KEY_START.test(text[i])) return { ok: false };
     let k = i + 1;
     while (k < text.length && KEY_CHAR.test(text[k])) k++;

@@ -1195,3 +1195,14 @@ for (const maxImages of [1, 2]) {
     assert.ok(out[1].content.includes(`(max ${maxImages} per reply)`));
   });
 }
+
+for (const ending of [' />', '/>', ' / >']) {
+  test(`GENERATION_ENDED: self-closing ${ending} and normal tags leave no closing characters behind`, async () => {
+    const msg = assistantMsg('m1', `before <pic prompt="office"${ending} middle <pic prompt="forest"> after`);
+    const f = fakeApi({ messages: { c1: [msg] } });
+    const svc = createService(f.api, { idGenerator: counterIdGen() });
+    await svc.handleGenerationEnded({ chatId: 'c1', messageId: 'm1' });
+    assert.equal(f.calls.filter((c) => c[0] === 'imageGen.generateNative').length, 2);
+    assert.equal(msg.content, 'before ![그림:p1|office](https://img/1.png) middle ![그림:p2|forest](https://img/1.png) after');
+  });
+}
